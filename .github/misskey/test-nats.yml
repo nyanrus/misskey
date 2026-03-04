@@ -17,6 +17,10 @@ id: aidx
 
 proxyRemoteFiles: true
 
+# Benchmark: remove rate limiter and increase concurrency to stress ACTIVE list
+deliverJobConcurrency: 1024
+deliverJobPerSec: 100000
+
 nats:
   servers:
     - 'nats://127.0.0.1:4222'

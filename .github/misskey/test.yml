@@ -17,3 +17,7 @@ redis:
 id: aidx
 
 proxyRemoteFiles: true
+
+# Benchmark: remove rate limiter and increase concurrency to stress ACTIVE list
+deliverJobConcurrency: 1024
+deliverJobPerSec: 100000

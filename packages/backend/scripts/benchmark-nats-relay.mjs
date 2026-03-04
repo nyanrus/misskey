@@ -44,7 +44,7 @@ const __dirname = dirname(__filename);
 
 const JOB_COUNTS = (process.env.BENCHMARK_JOB_COUNTS ?? '1000,5000,10000,50000')
 	.split(',').map(s => parseInt(s.trim()));
-const MOCK_DELAY_MS = parseInt(process.env.BENCHMARK_DELAY_MS ?? '100');
+const MOCK_DELAY_MS = parseInt(process.env.BENCHMARK_DELAY_MS ?? '1000');
 const MOCK_PORT = 19199;
 const STARTUP_TIMEOUT = 120_000;
 const BENCHMARK_TIMEOUT = 600_000;
@@ -52,22 +52,40 @@ const SETTLE_TIME = 5_000;
 const SAMPLE_INTERVAL_MS = 200;
 
 // -------------------------------------------------------------------
-// Mock HTTP server — simulates federation delivery target
+// Seeded PRNG (mulberry32) — deterministic delays for reproducibility
 // -------------------------------------------------------------------
 
-function startMockServer(delayMs) {
+function mulberry32(seed) {
+	return function() {
+		seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+		let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+}
+
+const PRNG_SEED = 42;
+
+// -------------------------------------------------------------------
+// Mock HTTP server — simulates federation delivery target
+// Delay is randomized ±50% around the base delay using a seeded PRNG.
+// -------------------------------------------------------------------
+
+function startMockServer(baseDelayMs) {
+	const rng = mulberry32(PRNG_SEED);
 	return new Promise((res) => {
 		const server = createServer((req, resp) => {
 			req.resume();
 			req.on('end', () => {
+				const delay = Math.round(baseDelayMs * (0.5 + rng()));
 				globalThis.setTimeout(() => {
 					resp.writeHead(202);
 					resp.end('accepted');
-				}, delayMs);
+				}, delay);
 			});
 		});
 		server.listen(MOCK_PORT, '127.0.0.1', () => {
-			process.stderr.write('Mock HTTP server on :' + MOCK_PORT + ' (delay=' + delayMs + 'ms)\n');
+			process.stderr.write('Mock HTTP server on :' + MOCK_PORT + ' (baseDelay=' + baseDelayMs + 'ms, seed=' + PRNG_SEED + ')\n');
 			res(server);
 		});
 	});
