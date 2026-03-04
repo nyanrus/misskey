@@ -205,29 +205,92 @@ async function stopServer(proc) {
 
 // -------------------------------------------------------------------
 // User creation — needed so signedPost has a real keypair
+// Persists user ID to a temp file so the second benchmark run
+// (same DB, different config) can reuse the same user.
 // -------------------------------------------------------------------
 
+const BENCH_USER_FILE = resolve(__dirname, '../../../.bench-user.json');
+
+async function loadPersistedUser() {
+	try {
+		const data = JSON.parse(await fs.readFile(BENCH_USER_FILE, 'utf-8'));
+		if (data.userId) {
+			process.stderr.write('  Reusing persisted user: ' + data.userId + '\n');
+			return data.userId;
+		}
+	} catch { /* file doesn't exist yet */ }
+	return null;
+}
+
+async function persistUser(userId, token) {
+	await fs.writeFile(BENCH_USER_FILE, JSON.stringify({ userId, token }));
+}
+
 async function getOrCreateBenchUser(port, setupPassword) {
+	// Check for persisted user from a previous benchmark run
+	const persisted = await loadPersistedUser();
+	if (persisted) return persisted;
+
 	// Try initial admin creation (works on fresh DB)
 	try {
+		const body = {
+			username: 'benchadmin',
+			password: 'BenchP4ss!',
+			...(setupPassword ? { setupPassword } : {}),
+		};
+		process.stderr.write('  Admin create attempt: port=' + port + ' setupPassword=' + (setupPassword ? 'yes(' + setupPassword.length + ' chars)' : 'none') + '\n');
 		const res = await fetch('http://127.0.0.1:' + port + '/api/admin/accounts/create', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				username: 'benchadmin',
-				password: 'BenchP4ss!',
-				...(setupPassword ? { setupPassword } : {}),
-			}),
+			body: JSON.stringify(body),
 		});
+		const text = await res.text();
+		process.stderr.write('  Admin create response: ' + res.status + ' ' + text.slice(0, 500) + '\n');
 		if (res.ok) {
-			const user = await res.json();
+			const user = JSON.parse(text);
 			process.stderr.write('  Created admin: ' + user.id + '\n');
+			await persistUser(user.id, user.token);
 			return user.id;
 		}
-	} catch { /* ignore */ }
+	} catch (err) {
+		process.stderr.write('  Admin create error: ' + err.message + '\n');
+	}
 
-	// Try regular signup (works when admin exists and registration enabled)
+	// Try signing in as existing admin and creating a user via admin API
 	try {
+		process.stderr.write('  Trying admin sign-in...\n');
+		const signInRes = await fetch('http://127.0.0.1:' + port + '/api/signin', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ username: 'benchadmin', password: 'BenchP4ss!' }),
+		});
+		const signInText = await signInRes.text();
+		process.stderr.write('  Sign-in response: ' + signInRes.status + ' ' + signInText.slice(0, 300) + '\n');
+		if (signInRes.ok) {
+			const signIn = JSON.parse(signInText);
+			const token = signIn.i ?? signIn.token;
+			if (token) {
+				// Use admin token to get own user info
+				const meRes = await fetch('http://127.0.0.1:' + port + '/api/i', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ i: token }),
+				});
+				if (meRes.ok) {
+					const me = await meRes.json();
+					process.stderr.write('  Signed in as admin: ' + me.id + '\n');
+					await persistUser(me.id, token);
+					return me.id;
+				}
+			}
+		}
+	} catch (err) {
+		process.stderr.write('  Admin sign-in error: ' + err.message + '\n');
+	}
+
+	// Try regular signup (only works in NODE_ENV=test or with registration enabled)
+	try {
+		process.stderr.write('  Signup attempt...\n');
 		const res = await fetch('http://127.0.0.1:' + port + '/api/signup', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -236,12 +299,17 @@ async function getOrCreateBenchUser(port, setupPassword) {
 				password: 'BenchP4ss!',
 			}),
 		});
+		const text = await res.text();
+		process.stderr.write('  Signup response: ' + res.status + ' ' + text.slice(0, 500) + '\n');
 		if (res.ok) {
-			const user = await res.json();
+			const user = JSON.parse(text);
 			process.stderr.write('  Created user: ' + user.id + '\n');
+			await persistUser(user.id, user.token);
 			return user.id;
 		}
-	} catch { /* ignore */ }
+	} catch (err) {
+		process.stderr.write('  Signup error: ' + err.message + '\n');
+	}
 
 	throw new Error('Failed to create bench user — check server logs');
 }
