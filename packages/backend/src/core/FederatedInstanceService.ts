@@ -56,14 +56,24 @@ export class FederatedInstanceService implements OnApplicationShutdown {
 		const index = await this.instancesRepository.findOneBy({ host });
 
 		if (index == null) {
-			const i = await this.instancesRepository.insertOne({
-				id: this.idService.gen(),
-				host,
-				firstRetrievedAt: new Date(),
-			});
+			try {
+				const i = await this.instancesRepository.insertOne({
+					id: this.idService.gen(),
+					host,
+					firstRetrievedAt: new Date(),
+				});
 
-			this.federatedInstanceCache.set(host, i);
-			return i;
+				this.federatedInstanceCache.set(host, i);
+				return i;
+			} catch {
+				// Unique constraint violation from concurrent insert — fetch the winner's row
+				const existing = await this.instancesRepository.findOneBy({ host });
+				if (existing) {
+					this.federatedInstanceCache.set(host, existing);
+					return existing;
+				}
+				throw new Error(`Failed to fetch or register instance: ${host}`);
+			}
 		} else {
 			this.federatedInstanceCache.set(host, index);
 			return index;
@@ -96,10 +106,12 @@ export class FederatedInstanceService implements OnApplicationShutdown {
 			.returning('*')
 			.execute()
 			.then((response) => {
-				return response.raw[0];
+				return response.raw[0] as MiInstance | undefined;
 			});
 
-		this.federatedInstanceCache.set(result.host, result);
+		if (result) {
+			this.federatedInstanceCache.set(result.host, result);
+		}
 	}
 
 	@bindThis

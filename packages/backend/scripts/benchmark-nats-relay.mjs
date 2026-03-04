@@ -45,7 +45,9 @@ const __dirname = dirname(__filename);
 const JOB_COUNTS = (process.env.BENCHMARK_JOB_COUNTS ?? '1000,5000,10000,50000')
 	.split(',').map(s => parseInt(s.trim()));
 const MOCK_DELAY_MS = parseInt(process.env.BENCHMARK_DELAY_MS ?? '1000');
-const MOCK_PORT = 19199;
+// Run 10 mock servers on different ports
+// → 10 separate pools × 256 sockets = 2560 total
+const MOCK_PORTS = Array.from({ length: 10 }, (_, i) => 19199 + i);
 const STARTUP_TIMEOUT = 120_000;
 const BENCHMARK_TIMEOUT = 600_000;
 const SETTLE_TIME = 5_000;
@@ -67,27 +69,45 @@ function mulberry32(seed) {
 const PRNG_SEED = 42;
 
 // -------------------------------------------------------------------
-// Mock HTTP server — simulates federation delivery target
+// Mock HTTP servers — simulate federation delivery targets
 // Delay is randomized ±50% around the base delay using a seeded PRNG.
+// Multiple servers on different ports to avoid per-host maxSockets limits.
 // -------------------------------------------------------------------
 
-function startMockServer(baseDelayMs) {
-	const rng = mulberry32(PRNG_SEED);
-	return new Promise((res) => {
-		const server = createServer((req, resp) => {
-			req.resume();
-			req.on('end', () => {
-				const delay = Math.round(baseDelayMs * (0.5 + rng()));
-				globalThis.setTimeout(() => {
-					resp.writeHead(202);
-					resp.end('accepted');
-				}, delay);
+function startMockServers(baseDelayMs, ports) {
+	let totalRequestCount = 0;
+	const servers = [];
+	return new Promise((resolve) => {
+		let started = 0;
+		for (const port of ports) {
+			const rng = mulberry32(PRNG_SEED + port);
+			const server = createServer((req, resp) => {
+				totalRequestCount++;
+				req.resume();
+				req.on('end', () => {
+					const delay = Math.round(baseDelayMs * (0.5 + rng()));
+					globalThis.setTimeout(() => {
+						resp.writeHead(202);
+						resp.end('accepted');
+					}, delay);
+				});
 			});
-		});
-		server.listen(MOCK_PORT, '127.0.0.1', () => {
-			process.stderr.write('Mock HTTP server on :' + MOCK_PORT + ' (baseDelay=' + baseDelayMs + 'ms, seed=' + PRNG_SEED + ')\n');
-			res(server);
-		});
+			// Match HTTP agent's keepAliveMsecs to avoid "socket hang up"
+			server.keepAliveTimeout = 60_000;
+			servers.push(server);
+			server.listen(port, '127.0.0.1', () => {
+				started++;
+				if (started === ports.length) {
+					process.stderr.write('Mock HTTP servers on ports ' + ports[0] + '-' + ports[ports.length - 1] + ' (baseDelay=' + baseDelayMs + 'ms)\n');
+					const handle = {
+						getRequestCount: () => totalRequestCount,
+						resetRequestCount: () => { totalRequestCount = 0; },
+						close: () => Promise.all(servers.map(s => new Promise(r => s.close(r)))),
+					};
+					resolve(handle);
+				}
+			});
+		}
 	});
 }
 
@@ -165,7 +185,30 @@ async function readConfig() {
 	const normalPath = resolve(builtDir, '.config.json');
 	let configPath;
 	try { await fs.access(testPath); configPath = testPath; } catch { configPath = normalPath; }
-	return JSON.parse(await fs.readFile(configPath, 'utf-8'));
+	return { config: JSON.parse(await fs.readFile(configPath, 'utf-8')), configPath };
+}
+
+/**
+ * Temporarily patch the config file so the server allows connections
+ * to 127.0.0.1 (our mock HTTP target). Without this, the SSRF protection
+ * in HttpRequestService blocks loopback addresses and deliver jobs fail
+ * silently without ever hitting the mock server.
+ */
+async function patchConfigForBenchmark(configPath) {
+	const original = await fs.readFile(configPath, 'utf-8');
+	const config = JSON.parse(original);
+	if (!config.allowedPrivateNetworks) {
+		config.allowedPrivateNetworks = [];
+	}
+	if (!config.allowedPrivateNetworks.includes('127.0.0.0/8')) {
+		config.allowedPrivateNetworks.push('127.0.0.0/8');
+	}
+	await fs.writeFile(configPath, JSON.stringify(config, null, '\t'));
+	return original;
+}
+
+async function restoreConfig(configPath, originalContent) {
+	await fs.writeFile(configPath, originalContent);
 }
 
 function buildQueueOptions(config, queueName) {
@@ -188,7 +231,7 @@ function buildQueueOptions(config, queueName) {
 async function startServer() {
 	const serverProcess = fork(join(__dirname, '../built/boot/entry.js'), [], {
 		cwd: join(__dirname, '..'),
-		env: { ...process.env, NODE_ENV: 'production', MK_DISABLE_CLUSTERING: '1' },
+		env: { ...process.env, NODE_ENV: 'test', MK_DISABLE_CLUSTERING: '1' },
 		stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
 	});
 	let ready = false;
@@ -229,14 +272,23 @@ async function stopServer(proc) {
 
 const BENCH_USER_FILE = resolve(__dirname, '../../../.bench-user.json');
 
-async function loadPersistedUser() {
+async function loadPersistedUser(port) {
 	try {
 		const data = JSON.parse(await fs.readFile(BENCH_USER_FILE, 'utf-8'));
-		if (data.userId) {
-			process.stderr.write('  Reusing persisted user: ' + data.userId + '\n');
-			return data.userId;
+		if (data.userId && data.token) {
+			// Verify the token is still valid (DB may have been reset)
+			const res = await fetch('http://127.0.0.1:' + port + '/api/i', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ i: data.token }),
+			});
+			if (res.ok) {
+				process.stderr.write('  Reusing persisted user: ' + data.userId + '\n');
+				return { userId: data.userId, token: data.token };
+			}
+			process.stderr.write('  Persisted token invalid (status ' + res.status + '), will re-create user\n');
 		}
-	} catch { /* file doesn't exist yet */ }
+	} catch { /* file doesn't exist or server not ready */ }
 	return null;
 }
 
@@ -246,7 +298,7 @@ async function persistUser(userId, token) {
 
 async function getOrCreateBenchUser(port, setupPassword) {
 	// Check for persisted user from a previous benchmark run
-	const persisted = await loadPersistedUser();
+	const persisted = await loadPersistedUser(port);
 	if (persisted) return persisted;
 
 	// Try initial admin creation (works on fresh DB)
@@ -268,7 +320,7 @@ async function getOrCreateBenchUser(port, setupPassword) {
 			const user = JSON.parse(text);
 			process.stderr.write('  Created admin: ' + user.id + '\n');
 			await persistUser(user.id, user.token);
-			return user.id;
+			return { userId: user.id, token: user.token };
 		}
 	} catch (err) {
 		process.stderr.write('  Admin create error: ' + err.message + '\n');
@@ -298,7 +350,7 @@ async function getOrCreateBenchUser(port, setupPassword) {
 					const me = await meRes.json();
 					process.stderr.write('  Signed in as admin: ' + me.id + '\n');
 					await persistUser(me.id, token);
-					return me.id;
+					return { userId: me.id, token };
 				}
 			}
 		}
@@ -323,7 +375,7 @@ async function getOrCreateBenchUser(port, setupPassword) {
 			const user = JSON.parse(text);
 			process.stderr.write('  Created user: ' + user.id + '\n');
 			await persistUser(user.id, user.token);
-			return user.id;
+			return { userId: user.id, token: user.token };
 		}
 	} catch (err) {
 		process.stderr.write('  Signup error: ' + err.message + '\n');
@@ -333,12 +385,32 @@ async function getOrCreateBenchUser(port, setupPassword) {
 }
 
 // -------------------------------------------------------------------
+// Enable federation so deliver jobs actually make HTTP requests
+// -------------------------------------------------------------------
+
+async function enableFederation(port, token) {
+	process.stderr.write('  Enabling federation (mode=all)...\n');
+	const res = await fetch('http://127.0.0.1:' + port + '/api/admin/update-meta', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ i: token, federation: 'all' }),
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		process.stderr.write('  Warning: failed to enable federation: ' + res.status + ' ' + text.slice(0, 200) + '\n');
+	} else {
+		process.stderr.write('  Federation enabled\n');
+	}
+}
+
+// -------------------------------------------------------------------
 // Single benchmark run
 // -------------------------------------------------------------------
 
-async function runBenchmark(config, jobCount, serverPid, userId) {
+async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
 	process.stderr.write('\n--- ' + mode + ' | ' + jobCount + ' jobs | delay=' + MOCK_DELAY_MS + 'ms ---\n');
+	mockServer.resetRequestCount();
 
 	const redisConfig = config.redisForJobQueue ?? config.redis;
 	const deliverQueue = new Queue('deliver', buildQueueOptions(config, 'deliver'));
@@ -359,10 +431,10 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 			user: { id: userId },
 			content,
 			digest,
-			to: 'http://127.0.0.1:' + MOCK_PORT + '/inbox',
+			to: `http://127.0.0.1:${MOCK_PORTS[i % MOCK_PORTS.length]}/inbox`,
 			isSharedInbox: false,
 		},
-		opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+		opts: { attempts: 1, removeOnComplete: true, removeOnFail: false },
 	}));
 
 	// Monitoring: ACTIVE list + process stats
@@ -393,12 +465,27 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 	let timedOut = false;
 	while (true) {
 		await sleep(200);
-		const counts = await deliverQueue.getJobCounts('active', 'waiting');
+		const counts = await deliverQueue.getJobCounts('active', 'waiting', 'failed');
 		if (counts.active + counts.waiting === 0) break;
 		if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
-			process.stderr.write('  warning: timeout\n');
+			process.stderr.write('  warning: timeout waiting for BullMQ drain\n');
 			timedOut = true;
 			break;
+		}
+	}
+
+	// In NATS relay mode, BullMQ jobs complete immediately after publishing
+	// to NATS. The actual HTTP delivery happens asynchronously via NATS
+	// consumers. Wait for mock server to receive all expected requests.
+	if (mode === 'nats-relay' && !timedOut) {
+		process.stderr.write('  BullMQ drained, waiting for NATS consumer delivery...\n');
+		while (mockServer.getRequestCount() < jobCount) {
+			await sleep(200);
+			if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
+				process.stderr.write('  warning: timeout waiting for NATS delivery (got ' + mockServer.getRequestCount() + '/' + jobCount + ')\n');
+				timedOut = true;
+				break;
+			}
 		}
 	}
 
@@ -409,9 +496,28 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 	const redisAfter = await getRedisStats(redisConfig);
 
 	const finalCounts = await deliverQueue.getJobCounts('active', 'waiting', 'completed', 'failed', 'delayed');
+
+	// Sample a few failed job errors for diagnostics
+	let failureSample = [];
+	if (finalCounts.failed > 0) {
+		try {
+			const failedJobs = await deliverQueue.getFailed(0, Math.min(3, finalCounts.failed) - 1);
+			failureSample = failedJobs.map(j => ({
+				id: j.id,
+				failedReason: j.failedReason,
+				stacktrace: (j.stacktrace ?? []).slice(0, 1),
+			}));
+		} catch { /* ignore */ }
+	}
+
 	await deliverQueue.close();
 
-	const jobsProcessed = jobCount - (finalCounts.active + finalCounts.waiting);
+	const mockRequestCount = mockServer.getRequestCount();
+	// In NATS mode, BullMQ jobs all "succeed" (relay), so use mock HTTP hits
+	// as the real delivery success count for accurate throughput measurement.
+	const jobsSucceeded = mode === 'nats-relay'
+		? mockRequestCount
+		: jobCount - finalCounts.failed - finalCounts.active - finalCounts.waiting;
 	const proc = computeProcessStats(procSamples);
 	const avgActive = activeSampleCount > 0 ? Math.round(activeSum / activeSampleCount * 100) / 100 : 0;
 	const redisCpuDelta = Math.round((redisAfter.cpuTotal - redisBefore.cpuTotal) * 1000) / 1000;
@@ -420,11 +526,14 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 		mode,
 		jobCount,
 		mockDelayMs: MOCK_DELAY_MS,
-		jobsProcessed,
+		jobsSucceeded,
+		jobsFailed: finalCounts.failed,
+		failureSample,
+		mockHttpRequests: mockRequestCount,
 		timedOut,
 		enqueueTimeMs: enqueueTime,
 		totalTimeMs: totalTime,
-		throughputJobsPerSec: Math.round(jobsProcessed / (totalTime / 1000)),
+		throughputJobsPerSec: Math.round(jobsSucceeded / (totalTime / 1000)),
 		maxActiveListSize: maxActive,
 		avgActiveListSize: avgActive,
 		avgCpuPercent: proc.avgCpuPercent,
@@ -435,7 +544,16 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 		finalCounts,
 	};
 
-	process.stderr.write('  Processed:  ' + jobsProcessed + '/' + jobCount + '\n');
+	process.stderr.write('  Succeeded:  ' + jobsSucceeded + '/' + jobCount + ' (failed: ' + finalCounts.failed + ', mock HTTP hits: ' + mockRequestCount + ')\n');
+	if (failureSample.length > 0) {
+		process.stderr.write('  Failure sample:\n');
+		for (const f of failureSample) {
+			process.stderr.write('    [' + f.id + '] ' + f.failedReason + '\n');
+			if (f.stacktrace.length > 0) {
+				process.stderr.write('      ' + f.stacktrace[0].split('\n').slice(0, 3).join('\n      ') + '\n');
+			}
+		}
+	}
 	process.stderr.write('  Throughput: ' + result.throughputJobsPerSec + ' jobs/sec\n');
 	process.stderr.write('  Max ACTIVE: ' + maxActive + '  |  Avg ACTIVE: ' + avgActive + '\n');
 	process.stderr.write('  Avg CPU:    ' + proc.avgCpuPercent + '%\n');
@@ -450,33 +568,52 @@ async function runBenchmark(config, jobCount, serverPid, userId) {
 // -------------------------------------------------------------------
 
 async function main() {
-	const config = await readConfig();
+	const { config, configPath } = await readConfig();
 	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
 	process.stderr.write('Benchmark mode: ' + mode + '\n');
 	process.stderr.write('Job counts: ' + JOB_COUNTS.join(', ') + '\n');
 	process.stderr.write('Mock delay: ' + MOCK_DELAY_MS + 'ms\n');
 
-	const mockServer = await startMockServer(MOCK_DELAY_MS);
-	const results = [];
-	let userId = null;
+	// Patch config to allow connections to 127.0.0.1 (mock server).
+	// This is needed when NODE_ENV=production (SSRF protection blocks loopback).
+	// In NODE_ENV=test the SSRF check is skipped, but the patch is harmless.
+	const originalConfig = await patchConfigForBenchmark(configPath);
+	process.stderr.write('Patched config: allowedPrivateNetworks includes 127.0.0.0/8\n');
 
-	for (const jobCount of JOB_COUNTS) {
-		const { serverProcess, startupTime } = await startServer();
-		try {
-			if (!userId) {
-				userId = await getOrCreateBenchUser(
+	// Clear persisted user since NODE_ENV=test wipes DB on each server start
+	try { await fs.unlink(BENCH_USER_FILE); } catch { /* ignore */ }
+
+	const mockServer = await startMockServers(MOCK_DELAY_MS, MOCK_PORTS);
+	const results = [];
+
+	try {
+		for (const jobCount of JOB_COUNTS) {
+			const { serverProcess, startupTime } = await startServer();
+			try {
+				// NODE_ENV=test causes dropSchema+synchronize, so DB is wiped on
+				// each server start. Must re-create user every time.
+				const user = await getOrCreateBenchUser(
 					config.port ?? 61812,
 					config.setupPassword,
 				);
+				const userId = user.userId;
+				const userToken = user.token;
+				if (userToken) {
+					await enableFederation(config.port ?? 61812, userToken);
+				}
+				const result = await runBenchmark(config, jobCount, serverProcess.pid, userId, mockServer);
+				results.push({ ...result, startupTimeMs: startupTime });
+			} finally {
+				await stopServer(serverProcess);
 			}
-			const result = await runBenchmark(config, jobCount, serverProcess.pid, userId);
-			results.push({ ...result, startupTimeMs: startupTime });
-		} finally {
-			await stopServer(serverProcess);
 		}
+	} finally {
+		// Always restore the original config
+		await restoreConfig(configPath, originalConfig);
+		process.stderr.write('Restored original config\n');
 	}
 
-	mockServer.close();
+	await mockServer.close();
 
 	console.log(JSON.stringify({
 		timestamp: new Date().toISOString(),

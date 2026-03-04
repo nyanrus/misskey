@@ -43,11 +43,15 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		const jsm = this.natsRelayService.getJetStreamManager();
 		if (!js || !jsm) throw new Error('NATS JetStream not initialized');
 
-		await this.ensureConsumer(jsm, NATS_STREAM.DELIVER, 'misskey-deliver-worker', NATS_SUBJECT.DELIVER);
-		await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX);
-
+		// NATS consumers can safely use higher concurrency than BullMQ because
+		// the per-job CPU overhead is lower (no Redis state management per job).
+		// Use the configured concurrency directly — HttpRequestService.maxSockets
+		// is already set to max(256, deliverJobConcurrency).
 		const deliverMaxAckPending = this.config.deliverJobConcurrency ?? 128;
 		const inboxMaxAckPending = this.config.inboxJobConcurrency ?? 16;
+
+		await this.ensureConsumer(jsm, NATS_STREAM.DELIVER, 'misskey-deliver-worker', NATS_SUBJECT.DELIVER, deliverMaxAckPending);
+		await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX, inboxMaxAckPending);
 
 		this.running = true;
 
@@ -65,22 +69,25 @@ export class NatsConsumerService implements OnApplicationShutdown {
 			return this.inboxProcessorService.process(fakeJob);
 		});
 
-		this.logger.succ('NATS consumers started');
+		this.logger.succ(`NATS consumers started (deliver max_ack_pending=${deliverMaxAckPending}, inbox max_ack_pending=${inboxMaxAckPending})`);
 	}
 
 	@bindThis
-	private async ensureConsumer(jsm: JetStreamManager, stream: string, name: string, subject: string): Promise<void> {
+	private async ensureConsumer(jsm: JetStreamManager, stream: string, name: string, subject: string, maxAckPending: number): Promise<void> {
 		try {
 			await jsm.consumers.info(stream, name);
+			// Update existing consumer to apply config changes (e.g. max_ack_pending)
+			await jsm.consumers.update(stream, name, {
+				max_ack_pending: maxAckPending,
+				ack_wait: 10 * 60 * 1_000_000_000,
+			});
 		} catch {
 			await jsm.consumers.add(stream, {
 				durable_name: name,
 				ack_policy: AckPolicy.Explicit,
 				deliver_policy: DeliverPolicy.All,
 				filter_subject: subject,
-				max_ack_pending: stream === NATS_STREAM.DELIVER
-					? (this.config.deliverJobConcurrency ?? 128)
-					: (this.config.inboxJobConcurrency ?? 16),
+				max_ack_pending: maxAckPending,
 				ack_wait: 10 * 60 * 1_000_000_000, // 10 minutes in nanoseconds
 			});
 		}
@@ -98,24 +105,30 @@ export class NatsConsumerService implements OnApplicationShutdown {
 			for await (const msg of consumer) {
 				if (!this.running) break;
 
+				let data: T;
 				try {
-					const data = JSON.parse(new TextDecoder().decode(msg.data)) as T;
-					logger.debug(`processing seq=${msg.seq}`);
-					const result = await handler(data);
-					msg.ack();
-					logger.debug(`completed(${result}) seq=${msg.seq}`);
-				} catch (err: unknown) {
-					const error = err as Error;
-					if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
-						// Non-retryable: ack to discard
-						msg.ack();
-						logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
-					} else {
-						// Retryable: nak with delay for backpressure
-						msg.nak(60_000); // retry after 60s
-						logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, will retry`);
-					}
+					data = JSON.parse(new TextDecoder().decode(msg.data)) as T;
+				} catch {
+					msg.ack(); // malformed — discard
+					continue;
 				}
+
+				logger.debug(`processing seq=${msg.seq}`);
+				handler(data)
+					.then((result) => {
+						msg.ack();
+						logger.debug(`completed(${result}) seq=${msg.seq}`);
+					})
+					.catch((err: unknown) => {
+						const error = err as Error;
+						if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
+							msg.ack();
+							logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
+						} else {
+							msg.nak(60_000);
+							logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, will retry`);
+						}
+					});
 			}
 		})();
 	}

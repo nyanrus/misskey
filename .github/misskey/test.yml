@@ -18,9 +18,6 @@ id: aidx
 
 proxyRemoteFiles: true
 
-# Benchmark: allow localhost for mock HTTP server
-allowedPrivateNetworks: ['127.0.0.0/8']
-
 # Benchmark: remove rate limiter and increase concurrency to stress ACTIVE list
 deliverJobConcurrency: 1024
 deliverJobPerSec: 100000
