@@ -244,6 +244,17 @@ redis:
 #  # You can specify more ioredis options...
 #  #username: example-username
 
+# ┌────────────────────────────────────────────────────────────┐
+#─┘ NATS JetStream (optional, for high-throughput queue relay) └──
+# When configured, the deliver and inbox queues use NATS JetStream
+# as a relay layer to bypass BullMQ's O(n) LREM bottleneck.
+# All other queues continue to use BullMQ directly.
+# If not configured, everything works as before.
+
+#nats:
+#  servers:
+#    - nats://localhost:4222
+
 #   ┌───────────────────────────────┐
 #───┘ Fulltext search configuration └─────────────────────────────
 

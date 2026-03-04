@@ -1,0 +1,107 @@
+name: Get queue benchmark
+
+on:
+  pull_request:
+    branches:
+      - master
+      - develop
+    paths:
+      - packages/backend/src/queue/**
+      - packages/backend/scripts/benchmark-nats-relay.mjs
+      - .github/workflows/get-queue-benchmark.yml
+  workflow_dispatch:
+
+jobs:
+  queue-benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:18
+        ports:
+          - 54312:5432
+        env:
+          POSTGRES_DB: test-misskey
+          POSTGRES_HOST_AUTH_METHOD: trust
+      redis:
+        image: redis:7
+        ports:
+          - 56312:6379
+
+    steps:
+    - uses: actions/checkout@v6.0.1
+      with:
+        submodules: true
+
+    - name: Start NATS with JetStream
+      run: |
+        docker run -d --name nats-js -p 4222:4222 nats:latest --jetstream
+        # Wait for NATS to be ready
+        for i in $(seq 1 30); do
+          if nc -z 127.0.0.1 4222 2>/dev/null; then
+            echo "NATS is ready"
+            break
+          fi
+          sleep 1
+        done
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4.2.0
+    - name: Use Node.js
+      uses: actions/setup-node@v6.1.0
+      with:
+        node-version-file: '.node-version'
+        cache: 'pnpm'
+    - run: pnpm i --frozen-lockfile
+    - name: Check pnpm-lock.yaml
+      run: git diff --exit-code pnpm-lock.yaml
+
+    # --- BullMQ-only benchmark ---
+    - name: Copy config (BullMQ-only)
+      run: cp .github/misskey/test.yml .config/default.yml
+    - name: Compile config (BullMQ-only)
+      run: pnpm compile-config
+    - name: Build
+      run: pnpm build
+    - name: Run migrations
+      run: pnpm --filter backend migrate
+    - name: Benchmark (BullMQ-only)
+      run: |
+        node packages/backend/scripts/benchmark-nats-relay.mjs > benchmark-bullmq.json
+        cat benchmark-bullmq.json
+
+    # --- NATS relay benchmark ---
+    - name: Copy config (NATS relay)
+      run: cp .github/misskey/test-nats.yml .config/default.yml
+    - name: Compile config (NATS relay)
+      run: pnpm compile-config
+    - name: Benchmark (NATS relay)
+      run: |
+        node packages/backend/scripts/benchmark-nats-relay.mjs > benchmark-nats.json
+        cat benchmark-nats.json
+
+    # --- Upload results ---
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v6
+      with:
+        name: queue-benchmark-results
+        path: |
+          benchmark-bullmq.json
+          benchmark-nats.json
+
+  save-pr-number:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions: {}
+    steps:
+      - name: Save PR number
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          echo "$PR_NUMBER" > ./pr_number
+      - uses: actions/upload-artifact@v6
+        with:
+          name: queue-benchmark-pr-number
+          path: pr_number

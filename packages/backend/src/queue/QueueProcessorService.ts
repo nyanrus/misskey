@@ -46,6 +46,8 @@ import { AggregateRetentionProcessorService } from './processors/AggregateRetent
 import { CleanRemoteNotesProcessorService } from './processors/CleanRemoteNotesProcessorService.js';
 import { QueueLoggerService } from './QueueLoggerService.js';
 import { QUEUE, baseWorkerOptions } from './const.js';
+import { NatsRelayService, NATS_SUBJECT } from './NatsRelayService.js';
+import { NatsConsumerService } from './NatsConsumerService.js';
 
 // ref. https://github.com/misskey-dev/misskey/pull/7635#issue-971097019
 function httpRelatedBackoff(attemptsMade: number) {
@@ -127,6 +129,8 @@ export class QueueProcessorService implements OnApplicationShutdown {
 		private checkModeratorsActivityProcessorService: CheckModeratorsActivityProcessorService,
 		private cleanProcessorService: CleanProcessorService,
 		private cleanRemoteNotesProcessorService: CleanRemoteNotesProcessorService,
+		private natsRelayService: NatsRelayService,
+		private natsConsumerService: NatsConsumerService,
 	) {
 		this.logger = this.queueLoggerService.logger;
 
@@ -270,6 +274,10 @@ export class QueueProcessorService implements OnApplicationShutdown {
 		//#region deliver
 		{
 			this.deliverQueueWorker = new Bull.Worker(QUEUE.DELIVER, (job) => {
+				if (this.natsRelayService.isEnabled) {
+					// Relay mode: publish to NATS and immediately complete BullMQ job
+					return this.natsRelayService.publish(NATS_SUBJECT.DELIVER, job.data, job.id).then(() => 'relayed to NATS');
+				}
 				if (Sentry != null) {
 					return Sentry.startSpan({ name: 'Queue: Deliver' }, () => this.deliverProcessorService.process(job));
 				} else {
@@ -310,6 +318,10 @@ export class QueueProcessorService implements OnApplicationShutdown {
 		//#region inbox
 		{
 			this.inboxQueueWorker = new Bull.Worker(QUEUE.INBOX, (job) => {
+				if (this.natsRelayService.isEnabled) {
+					// Relay mode: publish to NATS and immediately complete BullMQ job
+					return this.natsRelayService.publish(NATS_SUBJECT.INBOX, job.data, job.id).then(() => 'relayed to NATS');
+				}
 				if (Sentry != null) {
 					return Sentry.startSpan({ name: 'Queue: Inbox' }, () => this.inboxProcessorService.process(job));
 				} else {
@@ -548,6 +560,11 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 	@bindThis
 	public async start(): Promise<void> {
+		if (this.natsRelayService.isEnabled) {
+			await this.natsRelayService.init();
+			await this.natsConsumerService.start();
+		}
+
 		await Promise.all([
 			this.systemQueueWorker.run(),
 			this.dbQueueWorker.run(),
@@ -564,6 +581,11 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 	@bindThis
 	public async stop(): Promise<void> {
+		// Stop NATS consumers first (drain in-flight jobs)
+		if (this.natsRelayService.isEnabled) {
+			await this.natsConsumerService.stop();
+		}
+
 		await Promise.all([
 			this.systemQueueWorker.close(),
 			this.dbQueueWorker.close(),

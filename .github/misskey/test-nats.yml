@@ -1,0 +1,22 @@
+url: 'http://misskey.local'
+
+setupPassword: example_password_please_change_this_or_you_will_get_hacked
+
+port: 61812
+
+db:
+  host: 127.0.0.1
+  port: 54312
+  db: test-misskey
+  user: postgres
+  pass: ''
+redis:
+  host: 127.0.0.1
+  port: 56312
+id: aidx
+
+proxyRemoteFiles: true
+
+nats:
+  servers:
+    - 'nats://127.0.0.1:4222'

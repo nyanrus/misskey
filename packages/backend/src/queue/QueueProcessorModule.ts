@@ -8,6 +8,8 @@ import { CoreModule } from '@/core/CoreModule.js';
 import { GlobalModule } from '@/GlobalModule.js';
 import { QueueLoggerService } from './QueueLoggerService.js';
 import { QueueProcessorService } from './QueueProcessorService.js';
+import { NatsRelayService } from './NatsRelayService.js';
+import { NatsConsumerService } from './NatsConsumerService.js';
 import { DeliverProcessorService } from './processors/DeliverProcessorService.js';
 import { EndedPollNotificationProcessorService } from './processors/EndedPollNotificationProcessorService.js';
 import { PostScheduledNoteProcessorService } from './processors/PostScheduledNoteProcessorService.js';
@@ -51,6 +53,8 @@ import { RelationshipProcessorService } from './processors/RelationshipProcessor
 	],
 	providers: [
 		QueueLoggerService,
+		NatsRelayService,
+		NatsConsumerService,
 		TickChartsProcessorService,
 		ResyncChartsProcessorService,
 		CleanChartsProcessorService,
