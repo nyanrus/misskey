@@ -6,12 +6,16 @@
 /**
  * Benchmark: Misskey queue throughput & BullMQ ACTIVE list size.
  *
- * Starts a real Misskey backend server, pushes deliver jobs through the
- * BullMQ deliver queue at varying scales, and measures:
+ * Starts a real Misskey backend server with a mock HTTP target, pushes
+ * deliver jobs through the BullMQ deliver queue, and measures:
  *   - Throughput (jobs/sec)
- *   - Peak ACTIVE list size (the O(n) LREM bottleneck indicator)
- *   - Avg CPU usage (%) during each run
- *   - Avg / Peak RSS memory (MB)
+ *   - Peak & avg ACTIVE list size (the O(n) LREM bottleneck indicator)
+ *   - Avg CPU usage (%) of the server process
+ *   - Avg / Peak RSS memory (MB) of the server process
+ *   - Redis CPU seconds consumed during the benchmark
+ *
+ * A mock HTTP server simulates federation delivery delay so jobs stay
+ * in the ACTIVE list long enough to demonstrate the LREM bottleneck.
  *
  * Runs benchmarks for each job count in BENCHMARK_JOB_COUNTS, restarting
  * the server between runs for clean measurements.
@@ -20,15 +24,18 @@
  *
  * Environment variables:
  *   BENCHMARK_JOB_COUNTS - comma-separated job counts (default: 1000,5000,10000,50000)
+ *   BENCHMARK_DELAY_MS   - mock HTTP response delay in ms (default: 100)
  *
  * Outputs JSON to stdout (like measure-memory.mjs).
  */
 
-import { fork } from 'node:child_process';
-import { setTimeout } from 'node:timers/promises';
+import { fork, execSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { platform } from 'node:os';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { Queue } from 'bullmq';
 
@@ -37,74 +44,97 @@ const __dirname = dirname(__filename);
 
 const JOB_COUNTS = (process.env.BENCHMARK_JOB_COUNTS ?? '1000,5000,10000,50000')
 	.split(',').map(s => parseInt(s.trim()));
+const MOCK_DELAY_MS = parseInt(process.env.BENCHMARK_DELAY_MS ?? '100');
+const MOCK_PORT = 19199;
 const STARTUP_TIMEOUT = 120_000;
-const BENCHMARK_TIMEOUT = 300_000;
-const SETTLE_TIME = 3_000;
+const BENCHMARK_TIMEOUT = 600_000;
+const SETTLE_TIME = 5_000;
 const SAMPLE_INTERVAL_MS = 200;
 
 // -------------------------------------------------------------------
-// Process stats sampling (CPU ticks + RSS) via /proc on Linux, ps on macOS
+// Mock HTTP server — simulates federation delivery target
+// -------------------------------------------------------------------
+
+function startMockServer(delayMs) {
+	return new Promise((res) => {
+		const server = createServer((req, resp) => {
+			req.resume();
+			req.on('end', () => {
+				globalThis.setTimeout(() => {
+					resp.writeHead(202);
+					resp.end('accepted');
+				}, delayMs);
+			});
+		});
+		server.listen(MOCK_PORT, '127.0.0.1', () => {
+			process.stderr.write('Mock HTTP server on :' + MOCK_PORT + ' (delay=' + delayMs + 'ms)\n');
+			res(server);
+		});
+	});
+}
+
+// -------------------------------------------------------------------
+// Process stats sampling (CPU ticks + RSS)
 // -------------------------------------------------------------------
 
 async function sampleProcessStats(pid) {
 	const now = Date.now();
 	if (platform() === 'linux') {
 		try {
-			const stat = await fs.readFile(`/proc/${pid}/stat`, 'utf-8');
+			const stat = await fs.readFile('/proc/' + pid + '/stat', 'utf-8');
 			const fields = stat.split(' ');
-			// field 14 = utime, field 15 = stime (clock ticks)
 			const cpuTicks = parseInt(fields[13]) + parseInt(fields[14]);
-
-			const status = await fs.readFile(`/proc/${pid}/status`, 'utf-8');
+			const status = await fs.readFile('/proc/' + pid + '/status', 'utf-8');
 			const rssMatch = status.match(/VmRSS:\s+(\d+)\s+kB/);
 			const rssKb = rssMatch ? parseInt(rssMatch[1]) : 0;
 			return { cpuTicks, rssKb, wallMs: now };
-		} catch {
-			return null;
-		}
+		} catch { return null; }
 	} else {
-		// macOS / other: fall back to ps
 		try {
-			const { execSync } = await import('node:child_process');
-			const out = execSync(`ps -o rss=,cputime= -p ${pid}`, { encoding: 'utf-8' }).trim();
+			const out = execSync('ps -o rss=,cputime= -p ' + pid, { encoding: 'utf-8' }).trim();
 			const [rssStr, timeStr] = out.split(/\s+/);
 			const rssKb = parseInt(rssStr) || 0;
-			// cputime format is H:MM:SS or MM:SS — convert to centiseconds as proxy ticks
 			const parts = (timeStr ?? '0:00:00').split(':').map(Number);
 			const totalSec = parts.length === 3
 				? parts[0] * 3600 + parts[1] * 60 + parts[2]
 				: parts[0] * 60 + parts[1];
 			return { cpuTicks: Math.round(totalSec * 100), rssKb, wallMs: now };
-		} catch {
-			return null;
-		}
+		} catch { return null; }
 	}
 }
 
-/**
- * Compute avg CPU % from first/last tick samples and avg/peak RSS from all samples.
- * Linux clock ticks = sysconf(_SC_CLK_TCK), typically 100.
- */
-function computeStats(samples) {
+function computeProcessStats(samples) {
 	const CLK_TCK = 100;
-	const validSamples = samples.filter(Boolean);
-	if (validSamples.length < 2) {
-		return { avgCpuPercent: 0, avgRssMb: 0, peakRssMb: 0 };
-	}
+	const valid = samples.filter(Boolean);
+	if (valid.length < 2) return { avgCpuPercent: 0, avgRssMb: 0, peakRssMb: 0 };
 
-	const first = validSamples[0];
-	const last = validSamples[validSamples.length - 1];
-	const cpuDelta = last.cpuTicks - first.cpuTicks;
-	const wallDeltaSec = (last.wallMs - first.wallMs) / 1000;
-	const avgCpuPercent = wallDeltaSec > 0
-		? Math.round((cpuDelta / CLK_TCK / wallDeltaSec) * 100 * 100) / 100
+	const first = valid[0], last = valid[valid.length - 1];
+	const wallSec = (last.wallMs - first.wallMs) / 1000;
+	const avgCpuPercent = wallSec > 0
+		? Math.round((last.cpuTicks - first.cpuTicks) / CLK_TCK / wallSec * 100 * 100) / 100
 		: 0;
 
-	const rssValues = validSamples.map(s => s.rssKb);
-	const avgRssMb = Math.round(rssValues.reduce((a, b) => a + b, 0) / rssValues.length / 1024 * 100) / 100;
-	const peakRssMb = Math.round(Math.max(...rssValues) / 1024 * 100) / 100;
-
+	const rss = valid.map(s => s.rssKb);
+	const avgRssMb = Math.round(rss.reduce((a, b) => a + b, 0) / rss.length / 1024 * 100) / 100;
+	const peakRssMb = Math.round(Math.max(...rss) / 1024 * 100) / 100;
 	return { avgCpuPercent, avgRssMb, peakRssMb };
+}
+
+// -------------------------------------------------------------------
+// Redis CPU tracking
+// -------------------------------------------------------------------
+
+async function getRedisStats(redisConfig) {
+	const { default: Redis } = await import('ioredis');
+	const client = new Redis({
+		host: redisConfig.host, port: redisConfig.port,
+		password: redisConfig.pass || undefined, db: redisConfig.db ?? 0,
+	});
+	const info = await client.info('cpu');
+	await client.quit();
+	const cpuSys = parseFloat(info.match(/used_cpu_sys:([\d.]+)/)?.[1] ?? '0');
+	const cpuUser = parseFloat(info.match(/used_cpu_user:([\d.]+)/)?.[1] ?? '0');
+	return { cpuSys, cpuUser, cpuTotal: Math.round((cpuSys + cpuUser) * 1000) / 1000 };
 }
 
 // -------------------------------------------------------------------
@@ -115,15 +145,8 @@ async function readConfig() {
 	const builtDir = resolve(__dirname, '../../../built');
 	const testPath = resolve(builtDir, '._config_.json');
 	const normalPath = resolve(builtDir, '.config.json');
-
 	let configPath;
-	try {
-		await fs.access(testPath);
-		configPath = testPath;
-	} catch {
-		configPath = normalPath;
-	}
-
+	try { await fs.access(testPath); configPath = testPath; } catch { configPath = normalPath; }
 	return JSON.parse(await fs.readFile(configPath, 'utf-8'));
 }
 
@@ -131,16 +154,12 @@ function buildQueueOptions(config, queueName) {
 	const redis = config.redisForJobQueue ?? config.redis;
 	const urlHost = new URL(config.url).host;
 	const prefix = redis.prefix ?? urlHost;
-
 	return {
 		connection: {
-			host: redis.host,
-			port: redis.port,
-			password: redis.pass || undefined,
-			db: redis.db ?? 0,
-			family: redis.family ?? 0,
+			host: redis.host, port: redis.port,
+			password: redis.pass || undefined, db: redis.db ?? 0, family: redis.family ?? 0,
 		},
-		prefix: prefix ? `${prefix}:queue:${queueName}` : `queue:${queueName}`,
+		prefix: prefix ? prefix + ':queue:' + queueName : 'queue:' + queueName,
 	};
 }
 
@@ -151,103 +170,148 @@ function buildQueueOptions(config, queueName) {
 async function startServer() {
 	const serverProcess = fork(join(__dirname, '../built/boot/entry.js'), [], {
 		cwd: join(__dirname, '..'),
-		env: {
-			...process.env,
-			NODE_ENV: 'production',
-			MK_DISABLE_CLUSTERING: '1',
-		},
+		env: { ...process.env, NODE_ENV: 'production', MK_DISABLE_CLUSTERING: '1' },
 		stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
 	});
-
 	let ready = false;
 	serverProcess.on('message', (msg) => { if (msg === 'ok') ready = true; });
-	serverProcess.stdout?.on('data', (d) => process.stderr.write(`[server] ${d}`));
-	serverProcess.stderr?.on('data', (d) => process.stderr.write(`[server] ${d}`));
-	serverProcess.on('error', (err) => process.stderr.write(`[server error] ${err}\n`));
-
+	serverProcess.stdout?.on('data', (d) => process.stderr.write('[server] ' + d));
+	serverProcess.stderr?.on('data', (d) => process.stderr.write('[server] ' + d));
+	serverProcess.on('error', (err) => process.stderr.write('[server error] ' + err + '\n'));
 	const t0 = Date.now();
 	while (!ready) {
 		if (Date.now() - t0 > STARTUP_TIMEOUT) {
-			serverProcess.kill('SIGTERM');
+			try { process.kill(serverProcess.pid, 'SIGTERM'); } catch { /* ignore */ }
 			throw new Error('Server startup timeout');
 		}
-		await setTimeout(100);
+		await sleep(100);
 	}
-
 	const startupTime = Date.now() - t0;
-	process.stderr.write(`Server ready in ${startupTime}ms\n`);
-
+	process.stderr.write('Server ready in ' + startupTime + 'ms\n');
 	return { serverProcess, startupTime };
 }
 
-async function stopServer(serverProcess) {
-	serverProcess.kill('SIGTERM');
+async function stopServer(proc) {
+	try { process.kill(proc.pid, 'SIGTERM'); } catch { /* ignore */ }
 	let exited = false;
 	await new Promise((r) => {
-		serverProcess.on('exit', () => { exited = true; r(); });
-		setTimeout(10_000).then(() => {
-			if (!exited) serverProcess.kill('SIGKILL');
+		proc.on('exit', () => { exited = true; r(); });
+		sleep(10_000).then(() => {
+			if (!exited) { try { process.kill(proc.pid, 'SIGKILL'); } catch { /* ignore */ } }
 			r();
 		});
 	});
 }
 
 // -------------------------------------------------------------------
+// User creation — needed so signedPost has a real keypair
+// -------------------------------------------------------------------
+
+async function getOrCreateBenchUser(port, setupPassword) {
+	// Try initial admin creation (works on fresh DB)
+	try {
+		const res = await fetch('http://127.0.0.1:' + port + '/api/admin/accounts/create', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				username: 'benchadmin',
+				password: 'BenchP4ss!',
+				...(setupPassword ? { setupPassword } : {}),
+			}),
+		});
+		if (res.ok) {
+			const user = await res.json();
+			process.stderr.write('  Created admin: ' + user.id + '\n');
+			return user.id;
+		}
+	} catch { /* ignore */ }
+
+	// Try regular signup (works when admin exists and registration enabled)
+	try {
+		const res = await fetch('http://127.0.0.1:' + port + '/api/signup', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				username: 'bench' + Date.now().toString(36),
+				password: 'BenchP4ss!',
+			}),
+		});
+		if (res.ok) {
+			const user = await res.json();
+			process.stderr.write('  Created user: ' + user.id + '\n');
+			return user.id;
+		}
+	} catch { /* ignore */ }
+
+	throw new Error('Failed to create bench user — check server logs');
+}
+
+// -------------------------------------------------------------------
 // Single benchmark run
 // -------------------------------------------------------------------
 
-async function runBenchmark(config, jobCount, serverPid) {
+async function runBenchmark(config, jobCount, serverPid, userId) {
 	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
-	process.stderr.write(`\n--- ${mode} | ${jobCount} jobs ---\n`);
+	process.stderr.write('\n--- ' + mode + ' | ' + jobCount + ' jobs | delay=' + MOCK_DELAY_MS + 'ms ---\n');
 
+	const redisConfig = config.redisForJobQueue ?? config.redis;
 	const deliverQueue = new Queue('deliver', buildQueueOptions(config, 'deliver'));
-	await setTimeout(SETTLE_TIME);
+	await sleep(SETTLE_TIME);
+
+	// Build deliver jobs targeting the mock HTTP server
+	const content = JSON.stringify({
+		'@context': 'https://www.w3.org/ns/activitystreams',
+		type: 'Create',
+		actor: config.url + '/users/' + userId,
+		object: { type: 'Note', content: 'benchmark' },
+	});
+	const digest = 'SHA-256=' + createHash('sha256').update(content).digest('base64');
 
 	const jobs = Array.from({ length: jobCount }, (_, i) => ({
-		name: `bench-${i}`,
+		name: 'bench-' + i,
 		data: {
-			user: { id: '0000000000' },
-			content: JSON.stringify({
-				'@context': 'https://www.w3.org/ns/activitystreams',
-				type: 'Create',
-				id: `https://bench.example.com/activities/${i}`,
-			}),
-			digest: 'sha-256=benchmark',
-			to: 'https://bench.example.com/inbox',
+			user: { id: userId },
+			content,
+			digest,
+			to: 'http://127.0.0.1:' + MOCK_PORT + '/inbox',
 			isSharedInbox: false,
 		},
-		opts: {
-			attempts: 1,
-			removeOnComplete: true,
-			removeOnFail: true,
-		},
+		opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
 	}));
 
-	// Start monitoring ACTIVE list + process stats
+	// Monitoring: ACTIVE list + process stats
 	let maxActive = 0;
+	let activeSum = 0, activeSampleCount = 0;
 	const procSamples = [];
 	const monitorInterval = setInterval(async () => {
 		try {
 			const counts = await deliverQueue.getJobCounts('active', 'waiting');
 			if (counts.active > maxActive) maxActive = counts.active;
+			activeSum += counts.active;
+			activeSampleCount++;
 		} catch { /* ignore */ }
-		const sample = await sampleProcessStats(serverPid);
-		if (sample) procSamples.push(sample);
+		const s = await sampleProcessStats(serverPid);
+		if (s) procSamples.push(s);
 	}, SAMPLE_INTERVAL_MS);
+
+	// Snapshot Redis CPU before
+	const redisBefore = await getRedisStats(redisConfig);
 
 	// Push all jobs
 	const startTime = Date.now();
 	await deliverQueue.addBulk(jobs);
 	const enqueueTime = Date.now() - startTime;
-	process.stderr.write(`  Enqueued in ${enqueueTime}ms\n`);
+	process.stderr.write('  Enqueued in ' + enqueueTime + 'ms\n');
 
 	// Wait for drain
+	let timedOut = false;
 	while (true) {
-		await setTimeout(200);
+		await sleep(200);
 		const counts = await deliverQueue.getJobCounts('active', 'waiting');
 		if (counts.active + counts.waiting === 0) break;
 		if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
-			process.stderr.write('  ⚠ timeout\n');
+			process.stderr.write('  warning: timeout\n');
+			timedOut = true;
 			break;
 		}
 	}
@@ -255,64 +319,88 @@ async function runBenchmark(config, jobCount, serverPid) {
 	const totalTime = Date.now() - startTime;
 	clearInterval(monitorInterval);
 
+	// Snapshot Redis CPU after
+	const redisAfter = await getRedisStats(redisConfig);
+
 	const finalCounts = await deliverQueue.getJobCounts('active', 'waiting', 'completed', 'failed', 'delayed');
 	await deliverQueue.close();
 
-	const { avgCpuPercent, avgRssMb, peakRssMb } = computeStats(procSamples);
+	const jobsProcessed = jobCount - (finalCounts.active + finalCounts.waiting);
+	const proc = computeProcessStats(procSamples);
+	const avgActive = activeSampleCount > 0 ? Math.round(activeSum / activeSampleCount * 100) / 100 : 0;
+	const redisCpuDelta = Math.round((redisAfter.cpuTotal - redisBefore.cpuTotal) * 1000) / 1000;
 
 	const result = {
 		mode,
 		jobCount,
+		mockDelayMs: MOCK_DELAY_MS,
+		jobsProcessed,
+		timedOut,
 		enqueueTimeMs: enqueueTime,
 		totalTimeMs: totalTime,
-		throughputJobsPerSec: Math.round(jobCount / (totalTime / 1000)),
+		throughputJobsPerSec: Math.round(jobsProcessed / (totalTime / 1000)),
 		maxActiveListSize: maxActive,
-		avgCpuPercent,
-		avgRssMb,
-		peakRssMb,
+		avgActiveListSize: avgActive,
+		avgCpuPercent: proc.avgCpuPercent,
+		avgRssMb: proc.avgRssMb,
+		peakRssMb: proc.peakRssMb,
+		redisCpuSeconds: redisCpuDelta,
 		sampleCount: procSamples.length,
 		finalCounts,
 	};
 
-	process.stderr.write(`  Throughput: ${result.throughputJobsPerSec} jobs/sec\n`);
-	process.stderr.write(`  Max ACTIVE: ${maxActive}\n`);
-	process.stderr.write(`  Avg CPU:    ${avgCpuPercent}%\n`);
-	process.stderr.write(`  Avg RSS:    ${avgRssMb} MB  |  Peak RSS: ${peakRssMb} MB\n`);
+	process.stderr.write('  Processed:  ' + jobsProcessed + '/' + jobCount + '\n');
+	process.stderr.write('  Throughput: ' + result.throughputJobsPerSec + ' jobs/sec\n');
+	process.stderr.write('  Max ACTIVE: ' + maxActive + '  |  Avg ACTIVE: ' + avgActive + '\n');
+	process.stderr.write('  Avg CPU:    ' + proc.avgCpuPercent + '%\n');
+	process.stderr.write('  Avg RSS:    ' + proc.avgRssMb + ' MB  |  Peak: ' + proc.peakRssMb + ' MB\n');
+	process.stderr.write('  Redis CPU:  ' + redisCpuDelta + 's\n');
 
 	return result;
 }
 
 // -------------------------------------------------------------------
-// Main: loop over job counts, restart server each time
+// Main
 // -------------------------------------------------------------------
 
 async function main() {
 	const config = await readConfig();
 	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
-	process.stderr.write(`Benchmark mode: ${mode}\n`);
-	process.stderr.write(`Job counts: ${JOB_COUNTS.join(', ')}\n`);
+	process.stderr.write('Benchmark mode: ' + mode + '\n');
+	process.stderr.write('Job counts: ' + JOB_COUNTS.join(', ') + '\n');
+	process.stderr.write('Mock delay: ' + MOCK_DELAY_MS + 'ms\n');
 
+	const mockServer = await startMockServer(MOCK_DELAY_MS);
 	const results = [];
+	let userId = null;
 
 	for (const jobCount of JOB_COUNTS) {
 		const { serverProcess, startupTime } = await startServer();
 		try {
-			const result = await runBenchmark(config, jobCount, serverProcess.pid);
+			if (!userId) {
+				userId = await getOrCreateBenchUser(
+					config.port ?? 61812,
+					config.setupPassword,
+				);
+			}
+			const result = await runBenchmark(config, jobCount, serverProcess.pid, userId);
 			results.push({ ...result, startupTimeMs: startupTime });
 		} finally {
 			await stopServer(serverProcess);
 		}
 	}
 
+	mockServer.close();
+
 	console.log(JSON.stringify({
 		timestamp: new Date().toISOString(),
 		mode,
+		mockDelayMs: MOCK_DELAY_MS,
 		runs: results,
 	}, null, 2));
 }
 
 main().catch((err) => {
-	console.error(JSON.stringify({ error: err.message, timestamp: new Date().toISOString() }));
+	console.error(JSON.stringify({ error: err.message, stack: err.stack, timestamp: new Date().toISOString() }));
 	process.exit(1);
 });
-
