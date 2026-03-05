@@ -296,10 +296,16 @@ export class QueueProcessorService implements OnApplicationShutdown {
 				...baseWorkerOptions(this.config, QUEUE.DELIVER),
 				autorun: false,
 				concurrency: deliverConcurrency,
-				limiter: {
-					max: this.config.deliverJobPerSec ?? 128,
-					duration: 1000,
-				},
+				// In NATS relay mode the relay job just publishes to NATS (fast,
+				// no HTTP), so the per-second rate limiter is irrelevant and would
+				// artificially cap throughput.  Flow control is handled by the
+				// semaphore + max_ack_pending on the NATS consumer.
+				...(this.natsRelayService.isEnabled ? {} : {
+					limiter: {
+						max: this.config.deliverJobPerSec ?? 128,
+						duration: 1000,
+					},
+				}),
 				settings: {
 					backoffStrategy: httpRelatedBackoff,
 				},
@@ -345,10 +351,12 @@ export class QueueProcessorService implements OnApplicationShutdown {
 				...baseWorkerOptions(this.config, QUEUE.INBOX),
 				autorun: false,
 				concurrency: inboxConcurrency,
-				limiter: {
-					max: this.config.inboxJobPerSec ?? 32,
-					duration: 1000,
-				},
+				...(this.natsRelayService.isEnabled ? {} : {
+					limiter: {
+						max: this.config.inboxJobPerSec ?? 32,
+						duration: 1000,
+					},
+				}),
 				settings: {
 					backoffStrategy: httpRelatedBackoff,
 				},
