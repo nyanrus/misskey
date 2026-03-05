@@ -301,7 +301,6 @@ async function seedRemoteFollowers(dbConfig, localUserId, count) {
 	});
 	await client.connect();
 
-	const now = new Date().toISOString();
 	const followerIds = [];
 
 	for (let i = 0; i < count; i++) {
@@ -314,11 +313,11 @@ async function seedRemoteFollowers(dbConfig, localUserId, count) {
 
 		await client.query(`
 			INSERT INTO "user"
-				(id, "createdAt", username, "usernameLower", host, uri, inbox, "sharedInbox",
+				(id, username, "usernameLower", host, uri, inbox, "sharedInbox",
 				 "followersCount", "followingCount", "notesCount")
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 0, 0, 0)
+			VALUES ($1, $2, $3, $4, $5, $6, $6, 0, 0, 0)
 			ON CONFLICT DO NOTHING
-		`, [id, now, username, username.toLowerCase(), host, uri, inboxUrl]);
+		`, [id, username, username.toLowerCase(), host, uri, inboxUrl]);
 
 		await client.query(`
 			INSERT INTO "user_profile" ("userId") VALUES ($1)
