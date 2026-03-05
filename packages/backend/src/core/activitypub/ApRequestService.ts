@@ -38,8 +38,30 @@ type PrivateKey = {
 	keyId: string;
 };
 
+// Cache for Web Crypto CryptoKey objects keyed by PEM string.
+// Avoids repeated PKCS#8 import on every sign operation.
+type WebCryptoKey = Awaited<ReturnType<typeof crypto.subtle.importKey>>;
+const cryptoKeyCache = new Map<string, WebCryptoKey>();
+const textEncoder = new TextEncoder();
+
+async function importSigningKey(pem: string): Promise<WebCryptoKey> {
+	const cached = cryptoKeyCache.get(pem);
+	if (cached) return cached;
+
+	const der = crypto.createPrivateKey(pem).export({ type: 'pkcs8', format: 'der' });
+	const key = await crypto.subtle.importKey(
+		'pkcs8',
+		der,
+		{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+		false,
+		['sign'],
+	);
+	cryptoKeyCache.set(pem, key);
+	return key;
+}
+
 export class ApRequestCreator {
-	static createSignedPost(args: { key: PrivateKey, url: string, body: string, digest?: string, additionalHeaders: Record<string, string> }): Signed {
+	static async createSignedPost(args: { key: PrivateKey, url: string, body: string, digest?: string, additionalHeaders: Record<string, string> }): Promise<Signed> {
 		const u = new URL(args.url);
 		const digestHeader = args.digest ?? this.createDigest(args.body);
 
@@ -54,7 +76,7 @@ export class ApRequestCreator {
 			}, args.additionalHeaders),
 		};
 
-		const result = this.#signToRequest(request, args.key, ['(request-target)', 'date', 'host', 'digest']);
+		const result = await this.#signToRequest(request, args.key, ['(request-target)', 'date', 'host', 'digest']);
 
 		return {
 			request,
@@ -68,7 +90,7 @@ export class ApRequestCreator {
 		return `SHA-256=${crypto.createHash('sha256').update(body).digest('base64')}`;
 	}
 
-	static createSignedGet(args: { key: PrivateKey, url: string, additionalHeaders: Record<string, string> }): Signed {
+	static async createSignedGet(args: { key: PrivateKey, url: string, additionalHeaders: Record<string, string> }): Promise<Signed> {
 		const u = new URL(args.url);
 
 		const request: Request = {
@@ -81,7 +103,7 @@ export class ApRequestCreator {
 			}, args.additionalHeaders),
 		};
 
-		const result = this.#signToRequest(request, args.key, ['(request-target)', 'date', 'host', 'accept']);
+		const result = await this.#signToRequest(request, args.key, ['(request-target)', 'date', 'host', 'accept']);
 
 		return {
 			request,
@@ -91,9 +113,11 @@ export class ApRequestCreator {
 		};
 	}
 
-	static #signToRequest(request: Request, key: PrivateKey, includeHeaders: string[]): Signed {
+	static async #signToRequest(request: Request, key: PrivateKey, includeHeaders: string[]): Promise<Signed> {
 		const signingString = this.#genSigningString(request, includeHeaders);
-		const signature = crypto.sign('sha256', Buffer.from(signingString), key.privateKeyPem).toString('base64');
+		const cryptoKey = await importSigningKey(key.privateKeyPem);
+		const signatureBuffer = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', cryptoKey, textEncoder.encode(signingString));
+		const signature = Buffer.from(signatureBuffer).toString('base64');
 		const signatureHeader = `keyId="${key.keyId}",algorithm="rsa-sha256",headers="${includeHeaders.join(' ')}",signature="${signature}"`;
 
 		request.headers = this.#objectAssignWithLcKey(request.headers, {
@@ -160,7 +184,7 @@ export class ApRequestService {
 
 		const keypair = await this.userKeypairService.getUserKeypair(user.id);
 
-		const req = ApRequestCreator.createSignedPost({
+		const req = await ApRequestCreator.createSignedPost({
 			key: {
 				privateKeyPem: keypair.privateKey,
 				keyId: `${this.config.url}/users/${user.id}#main-key`,
@@ -189,7 +213,7 @@ export class ApRequestService {
 		const _followAlternate = followAlternate ?? true;
 		const keypair = await this.userKeypairService.getUserKeypair(user.id);
 
-		const req = ApRequestCreator.createSignedGet({
+		const req = await ApRequestCreator.createSignedGet({
 			key: {
 				privateKeyPem: keypair.privateKey,
 				keyId: `${this.config.url}/users/${user.id}#main-key`,

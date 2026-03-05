@@ -25,6 +25,8 @@ export type DeliverJobData = {
 	to: string;
 	/** whether it is sharedInbox */
 	isSharedInbox: boolean;
+	/** Set when job is a BullMQ shadow of a NATS-handled delivery */
+	natsHandled?: boolean;
 };
 
 export type InboxJobData = {

@@ -4,8 +4,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, type OnApplicationShutdown } from '@nestjs/common';
 import { MetricsTime, type JobType } from 'bullmq';
+import { connect, type NatsConnection, type JetStreamClient, type JetStreamManager } from 'nats';
+import { DiscardPolicy, RetentionPolicy, StorageType } from 'nats';
 import type { IActivity } from '@/core/activitypub/type.js';
 import type { MiDriveFile } from '@/models/DriveFile.js';
 import type { MiWebhook, WebhookEventTypes } from '@/models/Webhook.js';
@@ -98,8 +100,18 @@ function parseRedisInfo(infoText: string): Record<string, string> {
 	return result;
 }
 
+const NATS_DELIVER_DIRECT_SUBJECT = 'misskey.deliver.direct';
+const NATS_DELIVER_DIRECT_STREAM = 'MISSKEY_DELIVER_DIRECT';
+
+/** Exported for NatsConsumerService to subscribe to the direct deliver stream. */
+export { NATS_DELIVER_DIRECT_STREAM, NATS_DELIVER_DIRECT_SUBJECT };
+
 @Injectable()
-export class QueueService {
+export class QueueService implements OnApplicationShutdown {
+	private natsConnection: NatsConnection | null = null;
+	private natsJs: JetStreamClient | null = null;
+	private readonly natsEncoder = new TextEncoder();
+
 	constructor(
 		@Inject(DI.config)
 		private config: Config,
@@ -144,6 +156,29 @@ export class QueueService {
 	}
 
 	@bindThis
+	private async ensureNatsPublisher(): Promise<JetStreamClient> {
+		if (this.natsJs) return this.natsJs;
+		const nc = await connect({
+			servers: this.config.nats!.servers,
+			name: `misskey-${this.config.host}-publisher`,
+		});
+		const jsm = await nc.jetstreamManager();
+		await jsm.streams.add({
+			name: NATS_DELIVER_DIRECT_STREAM,
+			subjects: [NATS_DELIVER_DIRECT_SUBJECT],
+			retention: RetentionPolicy.Workqueue,
+			storage: StorageType.File,
+			discard: DiscardPolicy.New,
+			max_msgs: 1_000_000,
+		}).catch(() => {
+			// Stream already exists — idempotent
+		});
+		this.natsConnection = nc;
+		this.natsJs = nc.jetstream();
+		return this.natsJs;
+	}
+
+	@bindThis
 	public deliver(user: ThinUser, content: IActivity | null, to: string | null, isSharedInbox: boolean) {
 		if (content == null) return null;
 		if (to == null) return null;
@@ -162,6 +197,20 @@ export class QueueService {
 		};
 
 		const label = to.replace('https://', '').replace('/inbox', '');
+
+		if (this.config.nats) {
+			// Hot path: publish directly to NATS JetStream
+			return this.ensureNatsPublisher().then(js =>
+				js.publish(NATS_DELIVER_DIRECT_SUBJECT, this.natsEncoder.encode(JSON.stringify(data))),
+			).then(() => {
+				// Fire-and-forget BullMQ shadow job for dashboard visibility
+				this.deliverQueue.add(label, { ...data, natsHandled: true } as DeliverJobData, {
+					attempts: 1,
+					removeOnComplete: { age: 3600 * 24, count: 30 },
+					removeOnFail: { age: 3600 * 24, count: 30 },
+				}).catch(() => {});
+			});
+		}
 
 		return this.deliverQueue.add(label, data, {
 			attempts: this.config.deliverJobMaxAttempts ?? 12,
@@ -191,6 +240,41 @@ export class QueueService {
 		if (content == null) return null;
 		const contentBody = JSON.stringify(content);
 		const digest = ApRequestCreator.createDigest(contentBody);
+
+		if (this.config.nats) {
+			// Hot path: publish all jobs directly to NATS JetStream
+			const js = await this.ensureNatsPublisher();
+			const publishPromises: Promise<unknown>[] = [];
+			const shadowJobs: Array<{ name: string; data: DeliverJobData; opts: object }> = [];
+
+			for (const [to, isSharedInbox] of inboxes) {
+				const data: DeliverJobData = {
+					user,
+					content: contentBody,
+					digest,
+					to,
+					isSharedInbox,
+				};
+				publishPromises.push(
+					js.publish(NATS_DELIVER_DIRECT_SUBJECT, this.natsEncoder.encode(JSON.stringify(data))),
+				);
+				shadowJobs.push({
+					name: to.replace('https://', '').replace('/inbox', ''),
+					data: { ...data, natsHandled: true } as DeliverJobData,
+					opts: {
+						attempts: 1,
+						removeOnComplete: { age: 3600 * 24, count: 30 },
+						removeOnFail: { age: 3600 * 24, count: 30 },
+					},
+				});
+			}
+
+			await Promise.all(publishPromises);
+
+			// Fire-and-forget BullMQ shadow jobs for dashboard
+			this.deliverQueue.addBulk(shadowJobs).catch(() => {});
+			return;
+		}
 
 		const opts = {
 			attempts: this.config.deliverJobMaxAttempts ?? 12,
@@ -920,5 +1004,14 @@ export class QueueService {
 				},
 			},
 		};
+	}
+
+	@bindThis
+	async onApplicationShutdown(): Promise<void> {
+		if (this.natsConnection) {
+			await this.natsConnection.drain().catch(() => {});
+			this.natsConnection = null;
+			this.natsJs = null;
+		}
 	}
 }

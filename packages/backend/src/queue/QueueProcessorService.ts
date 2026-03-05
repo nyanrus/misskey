@@ -273,7 +273,15 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 		//#region deliver
 		{
-			this.deliverQueueWorker = new Bull.Worker(QUEUE.DELIVER, (job) => {
+			this.deliverQueueWorker = new Bull.Worker(QUEUE.DELIVER, async (job) => {
+				// NATS direct mode: shadow jobs are instantly completed for dashboard visibility
+				if (this.config.nats && job.data.natsHandled) {
+					return 'nats-shadow';
+				}
+				// NATS direct mode: permanently failed jobs pushed back from NATS consumer
+				if (this.config.nats && job.name === 'nats-failed') {
+					throw new Bull.UnrecoverableError(job.data.reason ?? 'NATS delivery permanently failed');
+				}
 				if (this.natsRelayService.isEnabled) {
 					// Relay mode: publish to NATS and hold the BullMQ slot until the
 					// NATS consumer signals completion (HTTP delivered / failed).
@@ -289,12 +297,15 @@ export class QueueProcessorService implements OnApplicationShutdown {
 			}, {
 				...baseWorkerOptions(this.config, QUEUE.DELIVER),
 				autorun: false,
-				concurrency: this.config.deliverJobConcurrency ?? 128,
+				concurrency: this.config.nats
+					? 256  // NATS direct mode: shadow jobs complete instantly, high concurrency is fine
+					: (this.config.deliverJobConcurrency ?? 128),
+				// In NATS direct mode, shadow jobs are instant — no limiter needed.
 				// In NATS relay mode the rate limiter is bypassed — the relay job now
 				// holds its BullMQ slot until HTTP delivery completes, so concurrency
 				// is the natural throughput cap.  Flow control is handled by the
 				// pendingJobs Map (max in-flight = concurrency).
-				...(this.natsRelayService.isEnabled ? {} : {
+				...((this.config.nats || this.natsRelayService.isEnabled) ? {} : {
 					limiter: {
 						max: this.config.deliverJobPerSec ?? 128,
 						duration: 1000,
