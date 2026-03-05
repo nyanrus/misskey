@@ -152,8 +152,8 @@ jobs:
         node packages/backend/scripts/benchmark-note-throughput.mjs > benchmark-note-throughput-bullmq.json
         cat benchmark-note-throughput-bullmq.json
       env:
-        BENCHMARK_RATES: '10,50,100,500'
-        BENCHMARK_DURATION_MS: '10000'
+        BENCHMARK_RATES: '1,2,5,10'
+        BENCHMARK_DURATION_MS: '20000'
         BENCHMARK_CONCURRENCY: '200'
         BENCHMARK_FOLLOWER_COUNT: '1000'
         BENCHMARK_DELAY_MS: '1000'
@@ -168,8 +168,8 @@ jobs:
         node packages/backend/scripts/benchmark-note-throughput.mjs > benchmark-note-throughput-nats.json
         cat benchmark-note-throughput-nats.json
       env:
-        BENCHMARK_RATES: '10,50,100,500'
-        BENCHMARK_DURATION_MS: '10000'
+        BENCHMARK_RATES: '1,2,5,10'
+        BENCHMARK_DURATION_MS: '20000'
         BENCHMARK_CONCURRENCY: '200'
         BENCHMARK_FOLLOWER_COUNT: '1000'
         BENCHMARK_DELAY_MS: '1000'
