@@ -51,7 +51,7 @@ const BENCHMARK_RATES = (process.env.BENCHMARK_RATES ?? '10,50,100,500')
 	.split(',').map(s => parseInt(s.trim()));
 const DURATION_MS = parseInt(process.env.BENCHMARK_DURATION_MS ?? '10000');
 const CONCURRENCY = parseInt(process.env.BENCHMARK_CONCURRENCY ?? '200');
-const FOLLOWER_COUNT = parseInt(process.env.BENCHMARK_FOLLOWER_COUNT ?? '5000');
+const FOLLOWER_COUNT = parseInt(process.env.BENCHMARK_FOLLOWER_COUNT ?? '1000');
 const MOCK_DELAY_MS = parseInt(process.env.BENCHMARK_DELAY_MS ?? '1000');
 
 const STARTUP_TIMEOUT = 120_000;
