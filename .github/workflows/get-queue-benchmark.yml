@@ -152,11 +152,13 @@ jobs:
         node packages/backend/scripts/benchmark-note-throughput.mjs > benchmark-note-throughput-bullmq.json
         cat benchmark-note-throughput-bullmq.json
       env:
-        BENCHMARK_RATES: '1000,5000,10000,50000'
+        BENCHMARK_RATES: '10,50,100,500'
         BENCHMARK_DURATION_MS: '10000'
         BENCHMARK_CONCURRENCY: '200'
         BENCHMARK_FOLLOWER_COUNT: '5000'
         BENCHMARK_DELAY_MS: '1000'
+
+    # --- NATS relay ---
     - name: Copy config (NATS relay)
       run: cp .github/misskey/test-nats.yml .config/default.yml
     - name: Compile config (NATS relay)
@@ -166,7 +168,7 @@ jobs:
         node packages/backend/scripts/benchmark-note-throughput.mjs > benchmark-note-throughput-nats.json
         cat benchmark-note-throughput-nats.json
       env:
-        BENCHMARK_RATES: '1000,5000,10000,50000'
+        BENCHMARK_RATES: '10,50,100,500'
         BENCHMARK_DURATION_MS: '10000'
         BENCHMARK_CONCURRENCY: '200'
         BENCHMARK_FOLLOWER_COUNT: '5000'
