@@ -22,6 +22,33 @@ export const NATS_SUBJECT = {
 	INBOX: 'misskey.inbox.job',
 } as const;
 
+/** Async semaphore — limits the number of concurrent in-flight NATS publishes. */
+class Semaphore {
+	private count: number;
+	private readonly queue: Array<() => void> = [];
+
+	constructor(count: number) {
+		this.count = count;
+	}
+
+	acquire(): Promise<void> {
+		if (this.count > 0) {
+			this.count--;
+			return Promise.resolve();
+		}
+		return new Promise(resolve => this.queue.push(resolve));
+	}
+
+	release(): void {
+		if (this.queue.length > 0) {
+			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+			this.queue.shift()!();
+		} else {
+			this.count++;
+		}
+	}
+}
+
 @Injectable()
 export class NatsRelayService implements OnApplicationShutdown {
 	private logger: Logger;
@@ -30,6 +57,8 @@ export class NatsRelayService implements OnApplicationShutdown {
 	private jsm: JetStreamManager | null = null;
 	private enabled = false;
 	private readonly encoder = new TextEncoder();
+	private deliverSemaphore: Semaphore | null = null;
+	private inboxSemaphore: Semaphore | null = null;
 
 	constructor(
 		@Inject(DI.config)
@@ -93,11 +122,36 @@ export class NatsRelayService implements OnApplicationShutdown {
 	public async publish(subject: string, data: unknown, msgId?: string): Promise<void> {
 		if (!this.js) throw new Error('NATS JetStream not initialized');
 
+		// Acquire a backpressure slot before publishing.  This blocks when the
+		// NATS consumer's max_ack_pending window is full, keeping the NATS
+		// stream depth bounded and the Redis waiting list as the real backlog.
+		const sem = subject === NATS_SUBJECT.DELIVER ? this.deliverSemaphore : this.inboxSemaphore;
+		if (sem) await sem.acquire();
+
 		const payload = this.encoder.encode(JSON.stringify(data));
 		const opts: { msgID?: string } = {};
 		if (msgId) opts.msgID = msgId;
 
 		await this.js.publish(subject, payload, opts);
+	}
+
+	/**
+	 * Initialize backpressure semaphores.  Must be called (by NatsConsumerService)
+	 * before any publish() calls so the semaphore window matches max_ack_pending.
+	 */
+	public initBackpressure(deliverWindow: number, inboxWindow: number): void {
+		this.deliverSemaphore = new Semaphore(deliverWindow);
+		this.inboxSemaphore = new Semaphore(inboxWindow);
+	}
+
+	/** Called by NatsConsumerService when a deliver message is acked. */
+	public releaseDeliverSlot(): void {
+		this.deliverSemaphore?.release();
+	}
+
+	/** Called by NatsConsumerService when an inbox message is acked. */
+	public releaseInboxSlot(): void {
+		this.inboxSemaphore?.release();
 	}
 
 	public getJetStreamClient(): JetStreamClient | null {

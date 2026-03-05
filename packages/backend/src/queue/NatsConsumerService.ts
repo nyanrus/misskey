@@ -69,6 +69,9 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		await this.ensureConsumer(jsm, NATS_STREAM.DELIVER, 'misskey-deliver-worker', NATS_SUBJECT.DELIVER, deliverMaxAckPending);
 		await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX, inboxMaxAckPending);
 
+		// Must be called before workers run() so publish() blocks correctly
+		this.natsRelayService.initBackpressure(deliverMaxAckPending, inboxMaxAckPending);
+
 		this.running = true;
 
 		const deliverConsumer = await js.consumers.get(NATS_STREAM.DELIVER, 'misskey-deliver-worker');
@@ -76,14 +79,14 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		this.processMessages(this.deliverConsumer, 'deliver', async (data: DeliverJobData) => {
 			const fakeJob = { data } as Bull.Job<DeliverJobData>;
 			return this.deliverProcessorService.process(fakeJob);
-		});
+		}, () => this.natsRelayService.releaseDeliverSlot());
 
 		const inboxConsumer = await js.consumers.get(NATS_STREAM.INBOX, 'misskey-inbox-worker');
 		this.inboxConsumer = await inboxConsumer.consume({ max_messages: inboxMaxAckPending });
 		this.processMessages(this.inboxConsumer, 'inbox', async (data: InboxJobData) => {
 			const fakeJob = { data } as Bull.Job<InboxJobData>;
 			return this.inboxProcessorService.process(fakeJob);
-		});
+		}, () => this.natsRelayService.releaseInboxSlot());
 
 		this.logger.succ(`NATS consumers started (deliver max_ack_pending=${deliverMaxAckPending}, inbox max_ack_pending=${inboxMaxAckPending})`);
 	}
@@ -114,6 +117,7 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		consumer: ConsumerMessages,
 		queueName: string,
 		handler: (data: T) => Promise<string>,
+		onAck: () => void,
 	): Promise<void> {
 		const logger = this.logger.createSubLogger(queueName);
 
@@ -126,6 +130,7 @@ export class NatsConsumerService implements OnApplicationShutdown {
 					data = JSON.parse(this.decoder.decode(msg.data)) as T;
 				} catch {
 					msg.ack(); // malformed — discard
+					onAck();
 					continue;
 				}
 
@@ -133,15 +138,18 @@ export class NatsConsumerService implements OnApplicationShutdown {
 				handler(data)
 					.then((result) => {
 						msg.ack();
+						onAck();
 						logger.debug(`completed(${result}) seq=${msg.seq}`);
 					})
 					.catch((err: unknown) => {
 						const error = err as Error;
 						if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
 							msg.ack();
+							onAck(); // unrecoverable — slot freed, message discarded
 							logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
 						} else {
 							msg.nak(60_000);
+							// do NOT release slot — message is still in NATS pending retry
 							logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, will retry`);
 						}
 					});

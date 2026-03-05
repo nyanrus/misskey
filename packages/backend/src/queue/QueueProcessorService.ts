@@ -273,6 +273,15 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 		//#region deliver
 		{
+			const deliverConcurrency = (() => {
+				if (!this.natsRelayService.isEnabled) return this.config.deliverJobConcurrency ?? 128;
+				// In NATS relay mode the relay worker must hold at least as many
+				// active BullMQ slots as the NATS window so it can always fill
+				// freed slots immediately, keeping backpressure tight.
+				const proc = this.config.deliverJobConcurrency ?? 128;
+				return this.config.natsDeliverConcurrency ?? Math.min(Math.max(proc * 4, 512), 4096);
+			})();
+
 			this.deliverQueueWorker = new Bull.Worker(QUEUE.DELIVER, (job) => {
 				if (this.natsRelayService.isEnabled) {
 					// Relay mode: publish to NATS and immediately complete BullMQ job
@@ -286,7 +295,7 @@ export class QueueProcessorService implements OnApplicationShutdown {
 			}, {
 				...baseWorkerOptions(this.config, QUEUE.DELIVER),
 				autorun: false,
-				concurrency: this.config.deliverJobConcurrency ?? 128,
+				concurrency: deliverConcurrency,
 				limiter: {
 					max: this.config.deliverJobPerSec ?? 128,
 					duration: 1000,
@@ -317,6 +326,11 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 		//#region inbox
 		{
+			const inboxConcurrency = (() => {
+				if (!this.natsRelayService.isEnabled) return this.config.inboxJobConcurrency ?? 16;
+				return this.config.natsInboxConcurrency ?? (this.config.inboxJobConcurrency ?? 16);
+			})();
+
 			this.inboxQueueWorker = new Bull.Worker(QUEUE.INBOX, (job) => {
 				if (this.natsRelayService.isEnabled) {
 					// Relay mode: publish to NATS and immediately complete BullMQ job
@@ -330,7 +344,7 @@ export class QueueProcessorService implements OnApplicationShutdown {
 			}, {
 				...baseWorkerOptions(this.config, QUEUE.INBOX),
 				autorun: false,
-				concurrency: this.config.inboxJobConcurrency ?? 16,
+				concurrency: inboxConcurrency,
 				limiter: {
 					max: this.config.inboxJobPerSec ?? 32,
 					duration: 1000,
