@@ -410,11 +410,12 @@ async function enableFederation(port, token) {
 async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
 	process.stderr.write('\n--- ' + mode + ' | ' + jobCount + ' jobs | delay=' + MOCK_DELAY_MS + 'ms ---\n');
-	mockServer.resetRequestCount();
-
 	const redisConfig = config.redisForJobQueue ?? config.redis;
 	const deliverQueue = new Queue('deliver', buildQueueOptions(config, 'deliver'));
 	await sleep(SETTLE_TIME);
+	// Reset after settle so any leftover in-flight NATS deliveries from the
+	// previous run that arrive during the settle window are discarded.
+	mockServer.resetRequestCount();
 
 	// Build deliver jobs targeting the mock HTTP server
 	const content = JSON.stringify({

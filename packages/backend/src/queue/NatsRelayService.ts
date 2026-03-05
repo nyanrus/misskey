@@ -5,7 +5,7 @@
 
 import { Inject, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import { connect, type NatsConnection, type JetStreamClient, type JetStreamManager } from 'nats';
-import { DiscardPolicy, StorageType } from 'nats';
+import { DiscardPolicy, RetentionPolicy, StorageType } from 'nats';
 import type { Config } from '@/config.js';
 import { DI } from '@/di-symbols.js';
 import type Logger from '@/logger.js';
@@ -73,7 +73,12 @@ export class NatsRelayService implements OnApplicationShutdown {
 			await this.jsm.streams.add({
 				name,
 				subjects,
-				storage: StorageType.File,
+				// Memory storage: no disk I/O per publish/fetch.
+				// Redis+BullMQ is the durable store; NATS is a fast relay bus only.
+				storage: StorageType.Memory,
+				// Purge messages once all consumers have acked them, keeping the
+				// stream compact regardless of how many jobs are in flight.
+				retention: RetentionPolicy.Interest,
 				max_bytes: -1,
 				max_age: 7 * 24 * 60 * 60 * 1_000_000_000, // 7 days in nanoseconds
 				discard: DiscardPolicy.Old,
