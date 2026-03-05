@@ -273,19 +273,13 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 		//#region deliver
 		{
-			const deliverConcurrency = (() => {
-				if (!this.natsRelayService.isEnabled) return this.config.deliverJobConcurrency ?? 128;
-				// In NATS relay mode the relay worker must hold at least as many
-				// active BullMQ slots as the NATS window so it can always fill
-				// freed slots immediately, keeping backpressure tight.
-				const proc = this.config.deliverJobConcurrency ?? 128;
-				return this.config.natsDeliverConcurrency ?? Math.min(Math.max(proc * 4, 512), 4096);
-			})();
-
 			this.deliverQueueWorker = new Bull.Worker(QUEUE.DELIVER, (job) => {
 				if (this.natsRelayService.isEnabled) {
-					// Relay mode: publish to NATS and immediately complete BullMQ job
-					return this.natsRelayService.publish(NATS_SUBJECT.DELIVER, job.data, job.id).then(() => 'relayed to NATS');
+					// Relay mode: publish to NATS and hold the BullMQ slot until the
+					// NATS consumer signals completion (HTTP delivered / failed).
+					// This makes BullMQ the durable store for retries / failed list,
+					// and its active-list size stays at `concurrency` (small = fast LREM).
+					return this.natsRelayService.publishAndWait(NATS_SUBJECT.DELIVER, job.data, job.id!);
 				}
 				if (Sentry != null) {
 					return Sentry.startSpan({ name: 'Queue: Deliver' }, () => this.deliverProcessorService.process(job));
@@ -295,11 +289,11 @@ export class QueueProcessorService implements OnApplicationShutdown {
 			}, {
 				...baseWorkerOptions(this.config, QUEUE.DELIVER),
 				autorun: false,
-				concurrency: deliverConcurrency,
-				// In NATS relay mode the relay job just publishes to NATS (fast,
-				// no HTTP), so the per-second rate limiter is irrelevant and would
-				// artificially cap throughput.  Flow control is handled by the
-				// semaphore + max_ack_pending on the NATS consumer.
+				concurrency: this.config.deliverJobConcurrency ?? 128,
+				// In NATS relay mode the rate limiter is bypassed — the relay job now
+				// holds its BullMQ slot until HTTP delivery completes, so concurrency
+				// is the natural throughput cap.  Flow control is handled by the
+				// pendingJobs Map (max in-flight = concurrency).
 				...(this.natsRelayService.isEnabled ? {} : {
 					limiter: {
 						max: this.config.deliverJobPerSec ?? 128,
@@ -332,15 +326,9 @@ export class QueueProcessorService implements OnApplicationShutdown {
 
 		//#region inbox
 		{
-			const inboxConcurrency = (() => {
-				if (!this.natsRelayService.isEnabled) return this.config.inboxJobConcurrency ?? 16;
-				return this.config.natsInboxConcurrency ?? (this.config.inboxJobConcurrency ?? 16);
-			})();
-
 			this.inboxQueueWorker = new Bull.Worker(QUEUE.INBOX, (job) => {
 				if (this.natsRelayService.isEnabled) {
-					// Relay mode: publish to NATS and immediately complete BullMQ job
-					return this.natsRelayService.publish(NATS_SUBJECT.INBOX, job.data, job.id).then(() => 'relayed to NATS');
+					return this.natsRelayService.publishAndWait(NATS_SUBJECT.INBOX, job.data, job.id!);
 				}
 				if (Sentry != null) {
 					return Sentry.startSpan({ name: 'Queue: Inbox' }, () => this.inboxProcessorService.process(job));
@@ -350,7 +338,7 @@ export class QueueProcessorService implements OnApplicationShutdown {
 			}, {
 				...baseWorkerOptions(this.config, QUEUE.INBOX),
 				autorun: false,
-				concurrency: inboxConcurrency,
+				concurrency: this.config.inboxJobConcurrency ?? 16,
 				...(this.natsRelayService.isEnabled ? {} : {
 					limiter: {
 						max: this.config.inboxJobPerSec ?? 32,

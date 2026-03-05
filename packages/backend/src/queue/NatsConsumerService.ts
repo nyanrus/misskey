@@ -13,7 +13,7 @@ import { bindThis } from '@/decorators.js';
 import { DeliverProcessorService } from './processors/DeliverProcessorService.js';
 import { InboxProcessorService } from './processors/InboxProcessorService.js';
 import { QueueLoggerService } from './QueueLoggerService.js';
-import { NatsRelayService, NATS_STREAM, NATS_SUBJECT } from './NatsRelayService.js';
+import { NatsRelayService, NATS_STREAM, NATS_SUBJECT, type NatsEnvelope } from './NatsRelayService.js';
 import type { DeliverJobData, InboxJobData } from './types.js';
 
 @Injectable()
@@ -69,24 +69,21 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		await this.ensureConsumer(jsm, NATS_STREAM.DELIVER, 'misskey-deliver-worker', NATS_SUBJECT.DELIVER, deliverMaxAckPending);
 		await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX, inboxMaxAckPending);
 
-		// Must be called before workers run() so publish() blocks correctly
-		this.natsRelayService.initBackpressure(deliverMaxAckPending, inboxMaxAckPending);
-
 		this.running = true;
 
 		const deliverConsumer = await js.consumers.get(NATS_STREAM.DELIVER, 'misskey-deliver-worker');
 		this.deliverConsumer = await deliverConsumer.consume({ max_messages: deliverMaxAckPending });
-		this.processMessages(this.deliverConsumer, 'deliver', async (data: DeliverJobData) => {
+		this.processMessages(this.deliverConsumer, NATS_SUBJECT.DELIVER, 'deliver', async (data: DeliverJobData) => {
 			const fakeJob = { data } as Bull.Job<DeliverJobData>;
 			return this.deliverProcessorService.process(fakeJob);
-		}, () => this.natsRelayService.releaseDeliverSlot());
+		});
 
 		const inboxConsumer = await js.consumers.get(NATS_STREAM.INBOX, 'misskey-inbox-worker');
 		this.inboxConsumer = await inboxConsumer.consume({ max_messages: inboxMaxAckPending });
-		this.processMessages(this.inboxConsumer, 'inbox', async (data: InboxJobData) => {
+		this.processMessages(this.inboxConsumer, NATS_SUBJECT.INBOX, 'inbox', async (data: InboxJobData) => {
 			const fakeJob = { data } as Bull.Job<InboxJobData>;
 			return this.inboxProcessorService.process(fakeJob);
-		}, () => this.natsRelayService.releaseInboxSlot());
+		});
 
 		this.logger.succ(`NATS consumers started (deliver max_ack_pending=${deliverMaxAckPending}, inbox max_ack_pending=${inboxMaxAckPending})`);
 	}
@@ -115,9 +112,9 @@ export class NatsConsumerService implements OnApplicationShutdown {
 	@bindThis
 	private async processMessages<T>(
 		consumer: ConsumerMessages,
+		subject: string,
 		queueName: string,
 		handler: (data: T) => Promise<string>,
-		onAck: () => void,
 	): Promise<void> {
 		const logger = this.logger.createSubLogger(queueName);
 
@@ -125,32 +122,34 @@ export class NatsConsumerService implements OnApplicationShutdown {
 			for await (const msg of consumer) {
 				if (!this.running) break;
 
+				let jobId: string;
 				let data: T;
 				try {
-					data = JSON.parse(this.decoder.decode(msg.data)) as T;
+					const envelope = JSON.parse(this.decoder.decode(msg.data)) as NatsEnvelope<T>;
+					jobId = envelope.jobId;
+					data = envelope.data;
 				} catch {
 					msg.ack(); // malformed — discard
-					onAck();
 					continue;
 				}
 
-				logger.debug(`processing seq=${msg.seq}`);
+				logger.debug(`processing seq=${msg.seq} jobId=${jobId}`);
 				handler(data)
 					.then((result) => {
 						msg.ack();
-						onAck();
+						this.natsRelayService.resolveJob(subject, jobId, result);
 						logger.debug(`completed(${result}) seq=${msg.seq}`);
 					})
 					.catch((err: unknown) => {
 						const error = err as Error;
+						// Always ack — BullMQ owns durability and retry semantics.
+						// Rejecting the BullMQ job lets it handle backoff / failed list.
+						msg.ack();
+						this.natsRelayService.rejectJob(subject, jobId, error);
 						if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
-							msg.ack();
-							onAck(); // unrecoverable — slot freed, message discarded
 							logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
 						} else {
-							msg.nak(60_000);
-							// do NOT release slot — message is still in NATS pending retry
-							logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, will retry`);
+							logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, BullMQ will retry`);
 						}
 					});
 			}
