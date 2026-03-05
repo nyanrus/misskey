@@ -164,11 +164,11 @@ export class QueueService {
 		const label = to.replace('https://', '').replace('/inbox', '');
 
 		return this.deliverQueue.add(label, data, {
-			attempts: this.config.deliverJobMaxAttempts ?? 12,
+			attempts: this.config.nats ? 1 : (this.config.deliverJobMaxAttempts ?? 12),
 			backoff: {
 				type: 'custom',
 			},
-			removeOnComplete: {
+			removeOnComplete: this.config.nats ? true : {
 				age: 3600 * 24 * 7, // keep up to 7 days
 				count: 30,
 			},
