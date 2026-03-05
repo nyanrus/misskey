@@ -43,12 +43,19 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		const jsm = this.natsRelayService.getJetStreamManager();
 		if (!js || !jsm) throw new Error('NATS JetStream not initialized');
 
-		// NATS consumers can safely use higher concurrency than BullMQ because
-		// the per-job CPU overhead is lower (no Redis state management per job).
-		// Use the configured concurrency directly — HttpRequestService.maxSockets
-		// is already set to max(256, deliverJobConcurrency).
-		const deliverMaxAckPending = this.config.deliverJobConcurrency ?? 128;
-		const inboxMaxAckPending = this.config.inboxJobConcurrency ?? 16;
+		// NATS consumers use a separate concurrency limit from BullMQ workers
+		// because BullMQ jobs in nats-relay mode complete instantly (just a
+		// publish), while NATS consumers do the actual slow HTTP delivery.
+		// The fallback window is sized to 4× the BullMQ concurrency (min 512,
+		// max 4096) so there are always enough in-flight slots to saturate the
+		// HTTP pool without unbounded memory growth in NATS.
+		const processingConcurrency = this.config.deliverJobConcurrency ?? 128;
+		const natsWindow = Math.min(
+			Math.max(processingConcurrency * 4, 512), // at least 512
+			4096, // never exceed this — memory cost
+		);
+		const deliverMaxAckPending = this.config.natsDeliverConcurrency ?? natsWindow;
+		const inboxMaxAckPending = this.config.natsInboxConcurrency ?? this.config.inboxJobConcurrency ?? 16;
 
 		await this.ensureConsumer(jsm, NATS_STREAM.DELIVER, 'misskey-deliver-worker', NATS_SUBJECT.DELIVER, deliverMaxAckPending);
 		await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX, inboxMaxAckPending);

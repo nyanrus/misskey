@@ -98,6 +98,8 @@ type Source = {
 	deliverJobConcurrency?: number;
 	inboxJobConcurrency?: number;
 	relationshipJobConcurrency?: number;
+	natsDeliverConcurrency?: number;
+	natsInboxConcurrency?: number;
 	deliverJobPerSec?: number;
 	inboxJobPerSec?: number;
 	relationshipJobPerSec?: number;
@@ -168,6 +170,8 @@ export type Config = {
 	deliverJobConcurrency: number | undefined;
 	inboxJobConcurrency: number | undefined;
 	relationshipJobConcurrency: number | undefined;
+	natsDeliverConcurrency: number | undefined;
+	natsInboxConcurrency: number | undefined;
 	deliverJobPerSec: number | undefined;
 	inboxJobPerSec: number | undefined;
 	relationshipJobPerSec: number | undefined;
@@ -333,6 +337,8 @@ export function loadConfig(): Config {
 		deliverJobConcurrency: config.deliverJobConcurrency,
 		inboxJobConcurrency: config.inboxJobConcurrency,
 		relationshipJobConcurrency: config.relationshipJobConcurrency,
+		natsDeliverConcurrency: config.natsDeliverConcurrency,
+		natsInboxConcurrency: config.natsInboxConcurrency,
 		deliverJobPerSec: config.deliverJobPerSec,
 		inboxJobPerSec: config.inboxJobPerSec,
 		relationshipJobPerSec: config.relationshipJobPerSec,
