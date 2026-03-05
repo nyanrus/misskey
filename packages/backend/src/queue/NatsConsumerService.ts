@@ -5,7 +5,7 @@
 
 import { Inject, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import * as Bull from 'bullmq';
-import { AckPolicy, DeliverPolicy, type ConsumerMessages, type JetStreamManager } from 'nats';
+import { connect, AckPolicy, DeliverPolicy, type NatsConnection, type ConsumerMessages, type JetStreamManager } from 'nats';
 import type { Config } from '@/config.js';
 import { DI } from '@/di-symbols.js';
 import type Logger from '@/logger.js';
@@ -19,9 +19,11 @@ import type { DeliverJobData, InboxJobData } from './types.js';
 @Injectable()
 export class NatsConsumerService implements OnApplicationShutdown {
 	private logger: Logger;
+	private connection: NatsConnection | null = null;
 	private deliverConsumer: ConsumerMessages | null = null;
 	private inboxConsumer: ConsumerMessages | null = null;
 	private running = false;
+	private readonly decoder = new TextDecoder();
 
 	constructor(
 		@Inject(DI.config)
@@ -39,9 +41,16 @@ export class NatsConsumerService implements OnApplicationShutdown {
 	public async start(): Promise<void> {
 		if (!this.natsRelayService.isEnabled) return;
 
-		const js = this.natsRelayService.getJetStreamClient();
-		const jsm = this.natsRelayService.getJetStreamManager();
-		if (!js || !jsm) throw new Error('NATS JetStream not initialized');
+		// Dedicated connection for consuming — keeps publish and consume
+		// traffic on separate TCP sockets so they don't starve each other
+		// under a 50k publish flood.
+		if (!this.config.nats) throw new Error('NATS config missing');
+		this.connection = await connect({
+			servers: this.config.nats.servers,
+			name: `misskey-${this.config.host}-consumer`,
+		});
+		const js = this.connection.jetstream();
+		const jsm = await this.connection.jetstreamManager();
 
 		// NATS consumers use a separate concurrency limit from BullMQ workers
 		// because BullMQ jobs in nats-relay mode complete instantly (just a
@@ -114,7 +123,7 @@ export class NatsConsumerService implements OnApplicationShutdown {
 
 				let data: T;
 				try {
-					data = JSON.parse(new TextDecoder().decode(msg.data)) as T;
+					data = JSON.parse(this.decoder.decode(msg.data)) as T;
 				} catch {
 					msg.ack(); // malformed — discard
 					continue;
@@ -150,6 +159,11 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		if (this.inboxConsumer) {
 			this.inboxConsumer.stop();
 			this.inboxConsumer = null;
+		}
+		if (this.connection) {
+			await this.connection.drain();
+			await this.connection.close();
+			this.connection = null;
 		}
 		this.logger.succ('NATS consumers stopped');
 	}

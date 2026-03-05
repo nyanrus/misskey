@@ -193,11 +193,11 @@ export class QueueService {
 		const digest = ApRequestCreator.createDigest(contentBody);
 
 		const opts = {
-			attempts: this.config.deliverJobMaxAttempts ?? 12,
+			attempts: this.config.nats ? 1 : (this.config.deliverJobMaxAttempts ?? 12),
 			backoff: {
 				type: 'custom',
 			},
-			removeOnComplete: {
+			removeOnComplete: this.config.nats ? true : {
 				age: 3600 * 24 * 7, // keep up to 7 days
 				count: 30,
 			},

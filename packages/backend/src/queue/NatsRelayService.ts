@@ -29,6 +29,7 @@ export class NatsRelayService implements OnApplicationShutdown {
 	private js: JetStreamClient | null = null;
 	private jsm: JetStreamManager | null = null;
 	private enabled = false;
+	private readonly encoder = new TextEncoder();
 
 	constructor(
 		@Inject(DI.config)
@@ -82,7 +83,7 @@ export class NatsRelayService implements OnApplicationShutdown {
 				max_bytes: -1,
 				max_age: 7 * 24 * 60 * 60 * 1_000_000_000, // 7 days in nanoseconds
 				discard: DiscardPolicy.Old,
-				duplicate_window: 60 * 1_000_000_000, // 1 minute dedup window
+				duplicate_window: 2 * 1_000_000_000, // 2 seconds — short enough to not accumulate a large dedup index
 			});
 			this.logger.succ(`Stream ${name} created`);
 		}
@@ -92,7 +93,7 @@ export class NatsRelayService implements OnApplicationShutdown {
 	public async publish(subject: string, data: unknown, msgId?: string): Promise<void> {
 		if (!this.js) throw new Error('NATS JetStream not initialized');
 
-		const payload = new TextEncoder().encode(JSON.stringify(data));
+		const payload = this.encoder.encode(JSON.stringify(data));
 		const opts: { msgID?: string } = {};
 		if (msgId) opts.msgID = msgId;
 
