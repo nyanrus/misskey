@@ -5,7 +5,7 @@
 
 import { Inject, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import * as Bull from 'bullmq';
-import { connect, AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type NatsConnection, type ConsumerMessages, type JetStreamManager } from 'nats';
+import { connect, AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type NatsConnection, type Consumer, type JetStreamManager } from 'nats';
 import type { Config } from '@/config.js';
 import { DI } from '@/di-symbols.js';
 import type Logger from '@/logger.js';
@@ -25,13 +25,53 @@ function httpRelatedBackoff(attempt: number): number {
 	return delays[Math.min(attempt, delays.length - 1)];
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Async counting semaphore — limits concurrent in-flight handlers. */
+class Semaphore {
+	private count: number;
+	private readonly waiters: Array<() => void> = [];
+
+	constructor(private readonly max: number) {
+		this.count = max;
+	}
+
+	available(): number {
+		return this.count;
+	}
+
+	acquire(): Promise<void> {
+		if (this.count > 0) {
+			this.count--;
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			this.waiters.push(resolve);
+		});
+	}
+
+	release(): void {
+		const next = this.waiters.shift();
+		if (next) {
+			// A waiter inherits the slot; count stays the same.
+			next();
+		} else {
+			this.count++;
+		}
+	}
+}
+
 @Injectable()
 export class NatsConsumerService implements OnApplicationShutdown {
 	private logger: Logger;
 	private connection: NatsConnection | null = null;
-	private deliverConsumer: ConsumerMessages | null = null;
-	private inboxConsumer: ConsumerMessages | null = null;
+	private deliverConsumer: Consumer | null = null;
+	private inboxConsumer: Consumer | null = null;
 	private running = false;
+	private processingConcurrency = 128;
+	private inboxConcurrency = 16;
 	private readonly decoder = new TextDecoder();
 
 	constructor(
@@ -64,13 +104,11 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		const jsm = await this.connection.jetstreamManager();
 
 		const processingConcurrency = this.config.deliverJobConcurrency ?? 128;
-		const natsWindow = Math.min(
-			Math.max(processingConcurrency * 4, 512),
-			4096,
-		);
-		const deliverMaxAckPending = this.config.natsDeliverConcurrency ?? natsWindow;
+		const deliverMaxAckPending = processingConcurrency;
 		const inboxMaxAckPending = this.config.natsInboxConcurrency ?? this.config.inboxJobConcurrency ?? 16;
 
+		this.processingConcurrency = processingConcurrency;
+		this.inboxConcurrency = inboxMaxAckPending;
 		this.running = true;
 
 		// Direct mode: ensure the deliver direct stream exists before subscribing.
@@ -80,8 +118,7 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		// Direct mode: deliver consumer reads from the direct stream (QueueService publishes raw DeliverJobData)
 		const maxDeliverAttempts = this.config.deliverJobMaxAttempts ?? 12;
 		await this.ensureConsumer(jsm, NATS_DELIVER_DIRECT_STREAM, 'misskey-deliver-direct', NATS_DELIVER_DIRECT_SUBJECT, deliverMaxAckPending, maxDeliverAttempts);
-		const deliverConsumer = await js.consumers.get(NATS_DELIVER_DIRECT_STREAM, 'misskey-deliver-direct');
-		this.deliverConsumer = await deliverConsumer.consume({ max_messages: deliverMaxAckPending });
+		this.deliverConsumer = await js.consumers.get(NATS_DELIVER_DIRECT_STREAM, 'misskey-deliver-direct');
 		this.processDirectMessages(this.deliverConsumer, 'deliver', async (data: DeliverJobData) => {
 			const fakeJob = { data } as Bull.Job<DeliverJobData>;
 			return this.deliverProcessorService.process(fakeJob);
@@ -90,15 +127,14 @@ export class NatsConsumerService implements OnApplicationShutdown {
 		// Relay mode: inbox consumer reads from the relay stream (NatsRelayService publishes NatsEnvelope)
 		if (this.natsRelayService.isEnabled) {
 			await this.ensureConsumer(jsm, NATS_STREAM.INBOX, 'misskey-inbox-worker', NATS_SUBJECT.INBOX, inboxMaxAckPending);
-			const inboxConsumer = await js.consumers.get(NATS_STREAM.INBOX, 'misskey-inbox-worker');
-			this.inboxConsumer = await inboxConsumer.consume({ max_messages: inboxMaxAckPending });
+			this.inboxConsumer = await js.consumers.get(NATS_STREAM.INBOX, 'misskey-inbox-worker');
 			this.processRelayMessages(this.inboxConsumer, NATS_SUBJECT.INBOX, 'inbox', async (data: InboxJobData) => {
 				const fakeJob = { data } as Bull.Job<InboxJobData>;
 				return this.inboxProcessorService.process(fakeJob);
 			});
 		}
 
-		this.logger.succ(`NATS consumers started (deliver direct max_ack_pending=${deliverMaxAckPending}, inbox relay max_ack_pending=${inboxMaxAckPending})`);
+		this.logger.succ(`NATS consumers started (deliver concurrency=${processingConcurrency}, inbox concurrency=${inboxMaxAckPending})`);
 	}
 
 	@bindThis
@@ -140,104 +176,144 @@ export class NatsConsumerService implements OnApplicationShutdown {
 
 	/**
 	 * Direct mode: NATS owns retry semantics.
-	 * - On success: msg.ack()
-	 * - On transient failure: msg.nak(backoffDelay)
-	 * - On permanent failure: msg.term() + push to BullMQ as nats-failed
+	 * Uses a fetch() loop with a semaphore for exact backpressure:
+	 * never fetches more messages than there are free processing slots,
+	 * so the "wave problem" and HeartbeatsMissed stalls are avoided.
 	 */
 	@bindThis
 	private async processDirectMessages<T>(
-		consumer: ConsumerMessages,
+		consumer: Consumer,
 		queueName: string,
 		handler: (data: T) => Promise<string>,
 	): Promise<void> {
 		const logger = this.logger.createSubLogger(queueName);
 		const maxAttempts = this.config.deliverJobMaxAttempts ?? 12;
+		const sem = new Semaphore(this.processingConcurrency);
 
 		(async () => {
-			for await (const msg of consumer) {
-				if (!this.running) break;
-
-				let data: T;
-				try {
-					data = JSON.parse(this.decoder.decode(msg.data)) as T;
-				} catch {
-					msg.term();
+			while (this.running) {
+				const available = sem.available();
+				if (available === 0) {
+					await sleep(10);
 					continue;
 				}
 
-				const redeliveryCount = msg.info.redeliveryCount;
-				logger.debug(`processing seq=${msg.seq} attempt=${redeliveryCount}`);
+				let msgs;
+				try {
+					msgs = await consumer.fetch({ max_messages: available, expires: 5_000 });
+				} catch {
+					if (!this.running) break;
+					await sleep(1_000);
+					continue;
+				}
 
-				handler(data)
-					.then((result) => {
-						msg.ack();
-						logger.debug(`completed(${result}) seq=${msg.seq}`);
-					})
-					.catch((err: unknown) => {
-						const error = err as Error;
-						const isPermanent = error instanceof Bull.UnrecoverableError || error.name === 'AbortError';
+				for await (const msg of msgs) {
+					if (!this.running) { msg.nak(0); break; }
 
-						if (isPermanent || redeliveryCount >= maxAttempts) {
-							// Permanent failure — terminate in NATS, push to BullMQ for admin visibility
-							msg.term();
-							logger.error(`permanent failure(${error.name}: ${error.message}) seq=${msg.seq}`);
-							this.pushFailedToBullMQ(data, error.message).catch(() => {});
-						} else {
-							// Transient failure — NAK with exponential backoff
-							const delay = httpRelatedBackoff(redeliveryCount);
-							msg.nak(delay);
-							logger.warn(`transient failure(${error.name}: ${error.message}) seq=${msg.seq}, retry in ${delay}ms`);
-						}
-					});
+					let data: T;
+					try {
+						data = JSON.parse(this.decoder.decode(msg.data)) as T;
+					} catch {
+						msg.term();
+						continue;
+					}
+
+					const redeliveryCount = msg.info.redeliveryCount;
+					logger.debug(`processing seq=${msg.seq} attempt=${redeliveryCount}`);
+
+					await sem.acquire();
+					handler(data)
+						.then((result) => {
+							msg.ack();
+							logger.debug(`completed(${result}) seq=${msg.seq}`);
+						})
+						.catch((err: unknown) => {
+							const error = err as Error;
+							const isPermanent = error instanceof Bull.UnrecoverableError || error.name === 'AbortError';
+
+							if (isPermanent || redeliveryCount >= maxAttempts) {
+								msg.term();
+								logger.error(`permanent failure(${error.name}: ${error.message}) seq=${msg.seq}`);
+								this.pushFailedToBullMQ(data, error.message).catch(() => {});
+							} else {
+								const delay = httpRelatedBackoff(redeliveryCount);
+								msg.nak(delay);
+								logger.warn(`transient failure(${error.name}: ${error.message}) seq=${msg.seq}, retry in ${delay}ms`);
+							}
+						})
+						.finally(() => sem.release());
+				}
 			}
 		})();
 	}
 
 	/**
 	 * Relay mode: BullMQ owns retry semantics.
+	 * Uses the same fetch() loop pattern as processDirectMessages.
 	 * Messages are always acked; relay promises are resolved/rejected.
 	 */
 	@bindThis
 	private async processRelayMessages<T>(
-		consumer: ConsumerMessages,
+		consumer: Consumer,
 		subject: string,
 		queueName: string,
 		handler: (data: T) => Promise<string>,
 	): Promise<void> {
 		const logger = this.logger.createSubLogger(queueName);
+		const sem = new Semaphore(this.inboxConcurrency);
 
 		(async () => {
-			for await (const msg of consumer) {
-				if (!this.running) break;
-
-				let jobId: string;
-				let data: T;
-				try {
-					const envelope = JSON.parse(this.decoder.decode(msg.data)) as NatsEnvelope<T>;
-					jobId = envelope.jobId;
-					data = envelope.data;
-				} catch {
-					msg.ack();
+			while (this.running) {
+				const available = sem.available();
+				if (available === 0) {
+					await sleep(10);
 					continue;
 				}
 
-				logger.debug(`processing seq=${msg.seq} jobId=${jobId}`);
-				handler(data)
-					.then((result) => {
+				let msgs;
+				try {
+					msgs = await consumer.fetch({ max_messages: available, expires: 5_000 });
+				} catch {
+					if (!this.running) break;
+					await sleep(1_000);
+					continue;
+				}
+
+				for await (const msg of msgs) {
+					if (!this.running) { msg.nak(0); break; }
+
+					let jobId: string;
+					let data: T;
+					try {
+						const envelope = JSON.parse(this.decoder.decode(msg.data)) as NatsEnvelope<T>;
+						jobId = envelope.jobId;
+						data = envelope.data;
+					} catch {
 						msg.ack();
-						this.natsRelayService.resolveJob(subject, jobId, result);
-						logger.debug(`completed(${result}) seq=${msg.seq}`);
-					})
-					.catch((err: unknown) => {
-						const error = err as Error;
-						msg.ack();
-						this.natsRelayService.rejectJob(subject, jobId, error);
-						if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
-							logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
-						} else {
-							logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, BullMQ will retry`);
-						}
-					});
+						continue;
+					}
+
+					logger.debug(`processing seq=${msg.seq} jobId=${jobId}`);
+
+					await sem.acquire();
+					handler(data)
+						.then((result) => {
+							msg.ack();
+							this.natsRelayService.resolveJob(subject, jobId, result);
+							logger.debug(`completed(${result}) seq=${msg.seq}`);
+						})
+						.catch((err: unknown) => {
+							const error = err as Error;
+							msg.ack();
+							this.natsRelayService.rejectJob(subject, jobId, error);
+							if (error instanceof Bull.UnrecoverableError || error.name === 'AbortError') {
+								logger.error(`unrecoverable(${error.name}: ${error.message}) seq=${msg.seq}`);
+							} else {
+								logger.error(`failed(${error.name}: ${error.message}) seq=${msg.seq}, BullMQ will retry`);
+							}
+						})
+						.finally(() => sem.release());
+				}
 			}
 		})();
 	}
@@ -254,14 +330,8 @@ export class NatsConsumerService implements OnApplicationShutdown {
 	@bindThis
 	public async stop(): Promise<void> {
 		this.running = false;
-		if (this.deliverConsumer) {
-			this.deliverConsumer.stop();
-			this.deliverConsumer = null;
-		}
-		if (this.inboxConsumer) {
-			this.inboxConsumer.stop();
-			this.inboxConsumer = null;
-		}
+		this.deliverConsumer = null;
+		this.inboxConsumer = null;
 		if (this.connection) {
 			await this.connection.drain();
 			await this.connection.close();
