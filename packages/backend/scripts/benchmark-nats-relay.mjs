@@ -38,6 +38,7 @@ import { platform } from 'node:os';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { Queue } from 'bullmq';
+import { connect as natsConnect } from 'nats';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -408,7 +409,7 @@ async function enableFederation(port, token) {
 // -------------------------------------------------------------------
 
 async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
-	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
+	const mode = config.nats ? 'nats-direct' : 'bullmq-only';
 	process.stderr.write('\n--- ' + mode + ' | ' + jobCount + ' jobs | delay=' + MOCK_DELAY_MS + 'ms ---\n');
 	const redisConfig = config.redisForJobQueue ?? config.redis;
 	const deliverQueue = new Queue('deliver', buildQueueOptions(config, 'deliver'));
@@ -426,16 +427,12 @@ async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 	});
 	const digest = 'SHA-256=' + createHash('sha256').update(content).digest('base64');
 
-	const jobs = Array.from({ length: jobCount }, (_, i) => ({
-		name: 'bench-' + i,
-		data: {
-			user: { id: userId },
-			content,
-			digest,
-			to: `http://127.0.0.1:${MOCK_PORTS[i % MOCK_PORTS.length]}/inbox`,
-			isSharedInbox: false,
-		},
-		opts: { attempts: 1, removeOnComplete: true, removeOnFail: false },
+	const jobDataList = Array.from({ length: jobCount }, (_, i) => ({
+		user: { id: userId },
+		content,
+		digest,
+		to: `http://127.0.0.1:${MOCK_PORTS[i % MOCK_PORTS.length]}/inbox`,
+		isSharedInbox: false,
 	}));
 
 	// Monitoring: ACTIVE list + process stats
@@ -456,34 +453,71 @@ async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 	// Snapshot Redis CPU before
 	const redisBefore = await getRedisStats(redisConfig);
 
-	// Push all jobs
 	const startTime = Date.now();
-	await deliverQueue.addBulk(jobs);
-	const enqueueTime = Date.now() - startTime;
-	process.stderr.write('  Enqueued in ' + enqueueTime + 'ms\n');
+
+	if (mode === 'nats-direct') {
+		// Publish directly to NATS JetStream (mirroring QueueService.deliverMany)
+		const nc = await natsConnect({
+			servers: config.nats.servers,
+			name: 'benchmark-publisher',
+		});
+		const js = nc.jetstream();
+		const encoder = new TextEncoder();
+
+		const BATCH_SIZE = 1000;
+		for (let i = 0; i < jobDataList.length; i += BATCH_SIZE) {
+			const batch = jobDataList.slice(i, i + BATCH_SIZE);
+			await Promise.all(batch.map(data =>
+				js.publish('misskey.deliver.direct', encoder.encode(JSON.stringify(data))),
+			));
+		}
+		const enqueueTime = Date.now() - startTime;
+		process.stderr.write('  Published ' + jobCount + ' to NATS in ' + enqueueTime + 'ms\n');
+
+		// Also add shadow BullMQ jobs (like QueueService does)
+		const shadowJobs = jobDataList.map((data, i) => ({
+			name: 'bench-' + i,
+			data: { ...data, natsHandled: true },
+			opts: { attempts: 1, removeOnComplete: true, removeOnFail: false },
+		}));
+		deliverQueue.addBulk(shadowJobs).catch(() => {});
+
+		await nc.drain();
+	} else {
+		// BullMQ-only: add jobs directly to queue
+		const jobs = jobDataList.map((data, i) => ({
+			name: 'bench-' + i,
+			data,
+			opts: { attempts: 1, removeOnComplete: true, removeOnFail: false },
+		}));
+		await deliverQueue.addBulk(jobs);
+		const enqueueTime = Date.now() - startTime;
+		process.stderr.write('  Enqueued in ' + enqueueTime + 'ms\n');
+	}
 
 	// Wait for drain
 	let timedOut = false;
-	while (true) {
-		await sleep(200);
-		const counts = await deliverQueue.getJobCounts('active', 'waiting', 'failed');
-		if (counts.active + counts.waiting === 0) break;
-		if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
-			process.stderr.write('  warning: timeout waiting for BullMQ drain\n');
-			timedOut = true;
-			break;
-		}
-	}
 
-	// In NATS relay mode, BullMQ jobs complete immediately after publishing
-	// to NATS. The actual HTTP delivery happens asynchronously via NATS
-	// consumers. Wait for mock server to receive all expected requests.
-	if (mode === 'nats-relay' && !timedOut) {
-		process.stderr.write('  BullMQ drained, waiting for NATS consumer delivery...\n');
+	if (mode === 'nats-direct') {
+		// In direct mode, actual delivery happens via NATS consumer.
+		// Wait for mock server to receive all expected requests.
+		process.stderr.write('  Waiting for NATS consumer delivery...\n');
 		while (mockServer.getRequestCount() < jobCount) {
 			await sleep(200);
 			if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
 				process.stderr.write('  warning: timeout waiting for NATS delivery (got ' + mockServer.getRequestCount() + '/' + jobCount + ')\n');
+				timedOut = true;
+				break;
+			}
+		}
+	} else {
+		// BullMQ-only: wait for queue to drain
+		while (true) {
+			await sleep(200);
+			const counts = await deliverQueue.getJobCounts('active', 'waiting', 'failed');
+			if (counts.active + counts.waiting === 0) break;
+			if (Date.now() - startTime > BENCHMARK_TIMEOUT) {
+				process.stderr.write('  warning: timeout waiting for BullMQ drain\n');
 				timedOut = true;
 				break;
 			}
@@ -514,9 +548,9 @@ async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 	await deliverQueue.close();
 
 	const mockRequestCount = mockServer.getRequestCount();
-	// In NATS mode, BullMQ jobs all "succeed" (relay), so use mock HTTP hits
-	// as the real delivery success count for accurate throughput measurement.
-	const jobsSucceeded = mode === 'nats-relay'
+	// In NATS direct mode, BullMQ shadow jobs all "succeed" instantly, so use
+	// mock HTTP hits as the real delivery success count for accurate throughput.
+	const jobsSucceeded = mode === 'nats-direct'
 		? mockRequestCount
 		: jobCount - finalCounts.failed - finalCounts.active - finalCounts.waiting;
 	const proc = computeProcessStats(procSamples);
@@ -570,7 +604,7 @@ async function runBenchmark(config, jobCount, serverPid, userId, mockServer) {
 
 async function main() {
 	const { config, configPath } = await readConfig();
-	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
+	const mode = config.nats ? 'nats-direct' : 'bullmq-only';
 	process.stderr.write('Benchmark mode: ' + mode + '\n');
 	process.stderr.write('Job counts: ' + JOB_COUNTS.join(', ') + '\n');
 	process.stderr.write('Mock delay: ' + MOCK_DELAY_MS + 'ms\n');

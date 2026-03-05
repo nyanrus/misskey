@@ -5,7 +5,7 @@
 
 import { Inject, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import * as Bull from 'bullmq';
-import { connect, AckPolicy, DeliverPolicy, type NatsConnection, type ConsumerMessages, type JetStreamManager } from 'nats';
+import { connect, AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType, type NatsConnection, type ConsumerMessages, type JetStreamManager } from 'nats';
 import type { Config } from '@/config.js';
 import { DI } from '@/di-symbols.js';
 import type Logger from '@/logger.js';
@@ -73,6 +73,10 @@ export class NatsConsumerService implements OnApplicationShutdown {
 
 		this.running = true;
 
+		// Direct mode: ensure the deliver direct stream exists before subscribing.
+		// QueueService also creates it lazily, but the consumer may start first.
+		await this.ensureStream(jsm, NATS_DELIVER_DIRECT_STREAM, [NATS_DELIVER_DIRECT_SUBJECT]);
+
 		// Direct mode: deliver consumer reads from the direct stream (QueueService publishes raw DeliverJobData)
 		const maxDeliverAttempts = this.config.deliverJobMaxAttempts ?? 12;
 		await this.ensureConsumer(jsm, NATS_DELIVER_DIRECT_STREAM, 'misskey-deliver-direct', NATS_DELIVER_DIRECT_SUBJECT, deliverMaxAckPending, maxDeliverAttempts);
@@ -114,6 +118,22 @@ export class NatsConsumerService implements OnApplicationShutdown {
 				deliver_policy: DeliverPolicy.All,
 				filter_subject: subject,
 				...config,
+			});
+		}
+	}
+
+	@bindThis
+	private async ensureStream(jsm: JetStreamManager, name: string, subjects: string[]): Promise<void> {
+		try {
+			await jsm.streams.info(name);
+		} catch {
+			await jsm.streams.add({
+				name,
+				subjects,
+				retention: RetentionPolicy.Workqueue,
+				storage: StorageType.File,
+				discard: DiscardPolicy.New,
+				max_msgs: 1_000_000,
 			});
 		}
 	}

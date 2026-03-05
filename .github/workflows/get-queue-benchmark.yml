@@ -75,12 +75,12 @@ jobs:
         node packages/backend/scripts/benchmark-nats-relay.mjs > benchmark-bullmq.json
         cat benchmark-bullmq.json
 
-    # --- NATS relay benchmark ---
-    - name: Copy config (NATS relay)
+    # --- NATS direct benchmark ---
+    - name: Copy config (NATS direct)
       run: cp .github/misskey/test-nats.yml .config/default.yml
-    - name: Compile config (NATS relay)
+    - name: Compile config (NATS direct)
       run: pnpm compile-config
-    - name: Benchmark (NATS relay)
+    - name: Benchmark (NATS direct)
       run: |
         node packages/backend/scripts/benchmark-nats-relay.mjs > benchmark-nats.json
         cat benchmark-nats.json
@@ -158,12 +158,12 @@ jobs:
         BENCHMARK_FOLLOWER_COUNT: '1000'
         BENCHMARK_DELAY_MS: '1000'
 
-    # --- NATS relay ---
-    - name: Copy config (NATS relay)
+    # --- NATS direct ---
+    - name: Copy config (NATS direct)
       run: cp .github/misskey/test-nats.yml .config/default.yml
-    - name: Compile config (NATS relay)
+    - name: Compile config (NATS direct)
       run: pnpm compile-config
-    - name: Benchmark note throughput (NATS relay)
+    - name: Benchmark note throughput (NATS direct)
       run: |
         node packages/backend/scripts/benchmark-note-throughput.mjs > benchmark-note-throughput-nats.json
         cat benchmark-note-throughput-nats.json

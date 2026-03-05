@@ -363,7 +363,7 @@ function percentile(sorted, p) {
 // -------------------------------------------------------------------
 
 async function runBenchmark(config, targetRate, serverPid, token, port, mockServer) {
-	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
+	const mode = config.nats ? 'nats-direct' : 'bullmq-only';
 	const expectedDeliverPerSec = targetRate * FOLLOWER_COUNT;
 	process.stderr.write('\n--- ' + mode + ' | target=' + targetRate + ' notes/sec'
 		+ ' (≈' + expectedDeliverPerSec + ' deliver jobs/sec)'
@@ -508,7 +508,7 @@ async function runBenchmark(config, targetRate, serverPid, token, port, mockServ
 async function main() {
 	const { config, configPath } = await readConfig();
 	const port = config.port ?? 61812;
-	const mode = config.nats ? 'nats-relay' : 'bullmq-only';
+	const mode = config.nats ? 'nats-direct' : 'bullmq-only';
 	process.stderr.write('Note → deliver throughput benchmark\n');
 	process.stderr.write('Mode:           ' + mode + '\n');
 	process.stderr.write('Target rates:   ' + BENCHMARK_RATES.join(', ') + ' notes/sec\n');
